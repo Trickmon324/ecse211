@@ -32,6 +32,8 @@ START_THETA = 0.0
 DRIVE_POWER = 40
 TURN_POWER = 25
 LINE_THRESHOLD = 0.0     # TODO: reading BELOW this = on a dark line
+HEADING_KP = 1.5         # power % added per degree of heading error (tune this)
+MAX_CORRECTION = 10      # max power % the correction may add/remove from a wheel
 MIN_LINE_SPACING = 12.0
 
 # ---------------------------------------------------------------- odometer ---
@@ -126,6 +128,9 @@ def drive_forward(distance):
     last_line_x, last_line_y = x, y
     left_hit = right_hit = False
 
+    # heading we want to hold for this whole side (nearest multiple of 90)
+    target_heading = (round(theta / 90.0) * 90.0) % 360.0
+
     left_motor.set_power(DRIVE_POWER)
     right_motor.set_power(DRIVE_POWER)
 
@@ -146,6 +151,17 @@ def drive_forward(distance):
                 left_hit = right_hit = False
                 left_motor.set_power(DRIVE_POWER)
                 right_motor.set_power(DRIVE_POWER)
+        # heading correction: if one wheel is pushing harder, theta drifts away
+        # from target_heading, so speed up one wheel and slow the other to steer back.
+        # theta increases when the left wheel is faster, so err<0 means "too far
+        # clockwise" -> slow the left wheel, speed up the right.
+        err = ((target_heading - theta + 180.0) % 360.0) - 180.0
+        corr = max(-MAX_CORRECTION, min(MAX_CORRECTION, HEADING_KP * err))
+        if not left_hit:
+            left_motor.set_power(DRIVE_POWER + corr)
+        if not right_hit:
+            right_motor.set_power(DRIVE_POWER - corr)
+
         time.sleep(0.005)
 
     _stop()
