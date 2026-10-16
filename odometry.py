@@ -94,15 +94,20 @@ def _odometer_loop():
 
 def _display_loop():
     while True:
-        print("x: %7.2f  y: %7.2f  theta: %6.1f" % (x, y, theta))
+        print("x: %7.2f  y: %7.2f  theta: %6.1f   light L: %s R: %s"
+              % (x, y, theta, _last_light["L"], _last_light["R"]))
         time.sleep(0.25)
 
 
 # ------------------------------------------------------------ light sensing ---
+_last_light = {"L": None, "R": None}   # latest readings, shown in the console
+
+
 def read_light(sensor):
     val = sensor.get_red()
     if isinstance(val, (list, tuple)):
         val = val[0]
+    _last_light["L" if sensor is left_light else "R"] = val
     return val
 
 
@@ -174,12 +179,16 @@ def drive_forward(distance):
     right_motor.set_power(DRIVE_POWER)
 
     while math.hypot(x - start_x, y - start_y) < distance:
+        # read both sensors EVERY loop so they stay in red-light mode
+        l_on = _on_line(left_light)
+        r_on = _on_line(right_light)
+
         if math.hypot(x - last_line_x, y - last_line_y) > MIN_LINE_SPACING:
-            if left_pos is None and _on_line(left_light):
+            if left_pos is None and l_on:
                 left_pos = (x, y)
                 if first_side is None:
                     first_side = "L"
-            if right_pos is None and _on_line(right_light):
+            if right_pos is None and r_on:
                 right_pos = (x, y)
                 if first_side is None:
                     first_side = "R"
@@ -238,6 +247,12 @@ def square_driver():
 if __name__ == "__main__":
     try:
         init_odometer()
+
+        # switch the sensors into red-light mode now, before the robot moves
+        read_light(left_light)
+        read_light(right_light)
+        if LINE_THRESHOLD == 0.0:
+            print("WARNING: LINE_THRESHOLD is still 0, so no line will ever be detected!")
         time.sleep(1)   # brief pause so you can step back after hitting Run
 
         Thread(target=_odometer_loop, daemon=True).start()
