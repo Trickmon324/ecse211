@@ -41,6 +41,8 @@ TURN_POWER = 25
 LINE_THRESHOLD = 0.0     # TODO: reading BELOW this = on a dark line
 MIN_LINE_SPACING = 12.0  # cm of travel required between two accepted lines
 MAX_HIT_GAP = 10.0       # cm; if the 2nd sensor doesn't see the line within this, ignore it
+HEADING_KP = 1.5         # power % added per degree of heading error (tune this)
+MAX_CORRECTION = 10      # max power % the correction may add/remove from a wheel
 
 # ---------------------------------------------------------------- odometer ---
 x, y, theta = START_X, START_Y, START_THETA
@@ -212,6 +214,16 @@ def drive_forward(distance):
                     left_pos = right_pos = None
                     first_side = None
                     last_line_x, last_line_y = x, y
+
+        # Keep driving straight: if one motor is stronger, the encoders show the
+        # robot's heading (theta) drifting away from target_heading, so slow the
+        # fast wheel and speed up the slow one.
+        # theta increases when the left wheel is faster, so err < 0 means
+        # "turned too far clockwise" -> slow the left wheel, speed up the right.
+        err = _heading_error(target_heading)
+        corr = max(-MAX_CORRECTION, min(MAX_CORRECTION, HEADING_KP * err))
+        left_motor.set_power(int(round(DRIVE_POWER + corr)))
+        right_motor.set_power(int(round(DRIVE_POWER - corr)))
 
         time.sleep(0.005)
 
