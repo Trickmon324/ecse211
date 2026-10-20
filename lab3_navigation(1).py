@@ -27,7 +27,7 @@ TURN_POWER = 25
 HEADING_KP = 1.5
 MAX_CORRECTION = 10
 CORRECTION_MULTIPLIER = 2.0
-MAX_STRENGTH_RATIO = 1.5
+MAXstrength_ratio = 1.5
 WHITE_LEFT = 350
 WHITE_RIGHT = 400
 LINE_DROP = 150
@@ -45,31 +45,30 @@ right_light = EV3ColorSensor(2)
 wait_ready_sensors(True)
 
 x, y, theta = START_X, START_Y, START_THETA
-_last_left = _last_right = 0.0
-_left_distance = _right_distance = _travel = 0.0
-_odo_lock = Lock()
-_shutdown = Event()
-_last_light = {"L": None, "R": None}
-_strength_ratio = 1.0
+last_left = last_right = 0.0
+left_distance = right_distance = travel = 0.0
+odo_lock = Lock()
+shutdown = Event()
+last_light = {"L": None, "R": None}
+strength_ratio = 1.0
 
 
 def init_odometer():
-    global x, y, theta, _last_left, _last_right
-    global _left_distance, _right_distance, _travel, _strength_ratio
-    with _odo_lock:
+    global x, y, theta, last_left, last_right
+    global left_distance, right_distance, travel, strength_ratio
+    with odo_lock:
         left_motor.reset_encoder()
         right_motor.reset_encoder()
-        _last_left = left_motor.get_encoder()
-        _last_right = right_motor.get_encoder()
-        x, y, theta = START_X, START_Y, START_THETA
-        _left_distance = _right_distance = _travel = 0.0
-    _strength_ratio = 1.0
-    _line_gate.reset()
-    _shutdown.clear()
+        last_left = left_motor.get_encoder()
+        last_right = right_motor.get_encoder()
+        x, y, theta = START_X, START_Y, START_THETA 
+        left_distance = right_distance = travel = 0.0
+    strength_ratio = 1.0
+    line_gate.reset()
+    shutdown.clear()
 
 
 def encoder_heading_change(left_cm, right_cm):
-    """Use the same direction-specific calibration for turns and odometry."""
     raw_angle = math.degrees((left_cm - right_cm) / TRACK_WIDTH)
     name, factor = (("RIGHT_TURN_FACTOR", RIGHT_TURN_FACTOR) if raw_angle >= 0
                     else ("LEFT_TURN_FACTOR", LEFT_TURN_FACTOR))
@@ -79,16 +78,16 @@ def encoder_heading_change(left_cm, right_cm):
 
 
 def update_odometer_locked():
-    global x, y, theta, _last_left, _last_right
-    global _left_distance, _right_distance, _travel
+    global x, y, theta, last_left, last_right
+    global left_distance, right_distance, travel
     cur_left = left_motor.get_encoder()
     cur_right = right_motor.get_encoder()
-    dl = math.radians(cur_left - _last_left) * WHEEL_RADIUS
-    dr = math.radians(cur_right - _last_right) * WHEEL_RADIUS
-    _last_left, _last_right = cur_left, cur_right
-    _left_distance += dl
-    _right_distance += dr
-    _travel += (abs(dl) + abs(dr)) / 2.0
+    dl = math.radians(cur_left - last_left) * WHEEL_RADIUS
+    dr = math.radians(cur_right - last_right) * WHEEL_RADIUS
+    last_left, last_right = cur_left, cur_right
+    left_distance += dl
+    right_distance += dr
+    travel += (abs(dl) + abs(dr)) / 2.0
     center = (dl + dr) / 2.0
     turn = encoder_heading_change(dl, dr)
     mid = math.radians(theta + turn / 2.0)
@@ -98,13 +97,13 @@ def update_odometer_locked():
 
 
 def update_odometer():
-    with _odo_lock:
+    with odo_lock:
         update_odometer_locked()
 
 
 def motion_state():
-    with _odo_lock:
-        return x, y, theta, _left_distance, _right_distance, _travel
+    with odo_lock:
+        return x, y, theta, left_distance, right_distance, travel
 
 
 def float_motors():
@@ -116,23 +115,23 @@ def float_motors():
 
 
 def odometer_loop():
-    while not _shutdown.is_set():
+    while not shutdown.is_set():
         update_odometer()
         time.sleep(LOOP_SECONDS)
 
 
 def display_loop():
-    while not _shutdown.is_set():
+    while not shutdown.is_set():
         px, py, heading = motion_state()[:3]
         print("x: %7.2f  y: %7.2f  theta: %6.1f  RGB L: %s R: %s"
-              % (px, py, heading, _last_light["L"], _last_light["R"]))
+              % (px, py, heading, last_light["L"], last_light["R"]))
         time.sleep(0.25)
 
 
 def read_light(sensor):
     rgb = sensor.get_value()
     total = sum(rgb[:3]) if rgb is not None and len(rgb) >= 3 else None
-    _last_light["L" if sensor is left_light else "R"] = total
+    last_light["L" if sensor is left_light else "R"] = total
     return total
 
 
@@ -148,13 +147,13 @@ class LineGate:
 
     def reset(self):
         self.ready_at = 0.0
-        self.last_travel = None
+        self.lasttravel = None
         self.armed = False
 
     def accept(self, left_on, right_on, now, travel):
         if left_on is None or right_on is None or now < self.ready_at:
             return False
-        if self.last_travel is not None and travel - self.last_travel < MIN_LINE_SPACING:
+        if self.lasttravel is not None and travel - self.lasttravel < MIN_LINE_SPACING:
             return False
         if not self.armed:
             if not left_on and not right_on:
@@ -164,18 +163,18 @@ class LineGate:
 
     def crossed(self, now, travel):
         self.ready_at = now + LINE_COOLDOWN_SECONDS
-        self.last_travel = travel
+        self.lasttravel = travel
         self.armed = False
 
 
-_line_gate = LineGate()
+line_gate = LineGate()
 
 
 class BalanceSample:
     def __init__(self, state, now):
         self.last_state = state
         self.last_time = now
-        self.left_travel = self.right_travel = 0.0
+        self.lefttravel = self.righttravel = 0.0
         self.left_input = self.right_input = 0.0
 
     def add(self, state, now, powers):
@@ -183,18 +182,18 @@ class BalanceSample:
         dl = state[3] - self.last_state[3]
         dr = state[4] - self.last_state[4]
         if dt > 0 and dl >= 0 and dr >= 0 and min(powers) > 0:
-            self.left_travel += dl
-            self.right_travel += dr
+            self.lefttravel += dl
+            self.righttravel += dr
             self.left_input += powers[0] * dt
             self.right_input += powers[1] * dt
         self.last_state, self.last_time = state, now
 
     def estimate(self, previous):
-        if min(self.left_travel, self.right_travel) < 2.0:
+        if min(self.lefttravel, self.righttravel) < 2.0:
             return previous
-        ratio = ((self.left_travel / self.left_input)
-                 / (self.right_travel / self.right_input))
-        return max(1.0 / MAX_STRENGTH_RATIO, min(MAX_STRENGTH_RATIO, ratio))
+        ratio = ((self.lefttravel / self.left_input)
+                 / (self.righttravel / self.right_input))
+        return max(1.0 / MAXstrength_ratio, min(MAXstrength_ratio, ratio))
 
 
 def stop():
@@ -208,10 +207,10 @@ def heading_error(target):
 
 def base_powers():
     left = right = float(DRIVE_POWER)
-    if _strength_ratio >= 1.0:
-        right *= 1.0 + CORRECTION_MULTIPLIER * (_strength_ratio - 1.0)
+    if strength_ratio >= 1.0:
+        right *= 1.0 + CORRECTION_MULTIPLIER * (strength_ratio - 1.0)
     else:
-        left *= 1.0 + CORRECTION_MULTIPLIER * (1.0 / _strength_ratio - 1.0)
+        left *= 1.0 + CORRECTION_MULTIPLIER * (1.0 / strength_ratio - 1.0)
     return left, right
 
 
@@ -228,7 +227,7 @@ def drive_powers(target_heading):
 
 def snap_to_line(target_heading, line):
     global x, y, theta
-    with _odo_lock:
+    with odo_lock:
         update_odometer_locked()
         h = int(round(target_heading)) % 360
         sign = 1 if h in (0, 90) else -1
@@ -240,7 +239,7 @@ def snap_to_line(target_heading, line):
 
 
 def drive_forward(distance, target_heading=None, light_correction=True):
-    global _strength_ratio
+    global strength_ratio
     if distance < 0:
         raise ValueError("drive_forward requires a nonnegative distance")
     state = motion_state()
@@ -251,7 +250,7 @@ def drive_forward(distance, target_heading=None, light_correction=True):
     if light_correction and abs(((target_heading + 45) % 90) - 45) > 0.001:
         raise ValueError("Light alignment requires a multiple-of-90 grid heading")
     if not light_correction:
-        _line_gate.armed = False
+        line_gate.armed = False
     heading_rad = math.radians(target_heading)
     started = time.monotonic()
     sample = BalanceSample(state, started)
@@ -278,7 +277,7 @@ def drive_forward(distance, target_heading=None, light_correction=True):
             l_on, r_on = ((on_line(left_light), on_line(right_light))
                           if light_correction else (False, False))
             if (light_correction and not aligning
-                    and _line_gate.accept(l_on, r_on, now, state[5])):
+                    and line_gate.accept(l_on, r_on, now, state[5])):
                 align_started, first_state = now, state
                 h = int(round(target_heading)) % 360
                 sign = 1 if h in (0, 90) else -1
@@ -298,9 +297,9 @@ def drive_forward(distance, target_heading=None, light_correction=True):
                     time.sleep(0.05)
                     snap_to_line(target_heading, line)
                     state = motion_state()
-                    _strength_ratio = sample.estimate(_strength_ratio)
-                    _line_gate.crossed(time.monotonic(), state[5])
-                    print("Line aligned; left/right strength: %.3f" % _strength_ratio)
+                    strength_ratio = sample.estimate(strength_ratio)
+                    line_gate.crossed(time.monotonic(), state[5])
+                    print("Line aligned; left/right strength: %.3f" % strength_ratio)
                     left_hit = right_hit = False
                     sample = BalanceSample(state, time.monotonic())
                     powers = drive_powers(target_heading)
@@ -341,7 +340,7 @@ def turn_by(angle):
             time.sleep(0.005)
     finally:
         stop()
-        _line_gate.armed = False
+        line_gate.armed = False
     print("Turn %s: encoder rotation %.1f deg; heading %.1f deg"
           % ("RIGHT" if sign > 0 else "LEFT", turned, motion_state()[2]))
 
@@ -455,7 +454,7 @@ if __name__ == "__main__":
         pass
     finally:
         stop()
-        _shutdown.set()
+        shutdown.set()
         for worker in workers:
             worker.join(timeout=1.0)
         reset_brick()
