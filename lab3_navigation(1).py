@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
-"""ECSE 211 Lab 3: safest and shortest waypoint navigation.
-
-Place the wheel axle midpoint at the grid origin, facing +y. WAYPOINTS use
-tile coordinates; odometry uses cm and clockwise degrees from +y. Choose
-NAVIGATION_MODE and edit the single WAYPOINTS list for the TA's route.
-Robot measurements and RGB white references must match the physical robot.
-"""
 
 import math
 import time
 from threading import Thread, Lock, Event
 from utils.brick import Motor, EV3ColorSensor, wait_ready_sensors, reset_brick
 
-# ---------------------- Edit these for the demonstration ---------------------
-NAVIGATION_MODE = "safest"  # "safest" or "shortest"; run each from the origin.
-WAYPOINTS = [(2, 1), (1, 1), (1, 2), (2, 0)]  # EXAMPLE: replace with TA's 4 points.
-AXIS_ORDER = ("x", "y")  # Safest mode visits the x coordinate, then y.
-POSITION_TOLERANCE_CM = 0.5  # Avoid turning around to chase tiny position errors.
+NAVIGATION_MODE = "safest"
+WAYPOINTS = [(2, 1), (1, 1), (1, 2), (2, 0)]
+AXIS_ORDER = ("x", "y") 
+POSITION_TOLERANCE_CM = 0.5
 
 WHEEL_RADIUS = 2.1
-TRACK_WIDTH = 13.0       # Original measured width; do not also multiply by a factor.
-RIGHT_TURN_FACTOR = 1.08  # Replace with the final RIGHT factor from calibration.
-LEFT_TURN_FACTOR = 1.04651   # Replace with the final LEFT factor from calibration.
-SENSOR_OFFSET = 4.0       # cm forward from axle to sensors
-SENSOR_SEPARATION = 6.3  # cm between sensors; retain for robot measurements
+TRACK_WIDTH = 13.0      
+RIGHT_TURN_FACTOR = 1.08 
+LEFT_TURN_FACTOR = 1.04651 
+SENSOR_OFFSET = 4.0   
+SENSOR_SEPARATION = 6.3 
 TILE = 30.48
-SQUARE_SIDE = 90.0       # Retains the partners' square size, in cm.
+SQUARE_SIDE = 90.0 
 START_X = 0.0
 START_Y = 0.0
-START_THETA = 0.0        # 0 = +y, 90 = +x
+START_THETA = 0.0   
 
 DRIVE_POWER = 15
 TURN_POWER = 25
@@ -36,12 +28,12 @@ HEADING_KP = 1.5
 MAX_CORRECTION = 10
 CORRECTION_MULTIPLIER = 2.0
 MAX_STRENGTH_RATIO = 1.5
-WHITE_LEFT = 420
-WHITE_RIGHT = 500
+WHITE_LEFT = 350
+WHITE_RIGHT = 400
 LINE_DROP = 150
 LINE_COOLDOWN_SECONDS = 1.0
-MIN_LINE_SPACING = 12.0  # cm travelled between accepted lines
-MAX_HIT_GAP = 10.0      # max wheel travel while waiting for second sensor
+MIN_LINE_SPACING = 12.0  
+MAX_HIT_GAP = 10.0    
 ALIGN_TIMEOUT_SECONDS = 6.0
 MOTION_TIMEOUT_SECONDS = 120.0
 LOOP_SECONDS = 0.01
@@ -76,7 +68,7 @@ def init_odometer():
     _shutdown.clear()
 
 
-def _encoder_heading_change(left_cm, right_cm):
+def encoder_heading_change(left_cm, right_cm):
     """Use the same direction-specific calibration for turns and odometry."""
     raw_angle = math.degrees((left_cm - right_cm) / TRACK_WIDTH)
     name, factor = (("RIGHT_TURN_FACTOR", RIGHT_TURN_FACTOR) if raw_angle >= 0
@@ -86,7 +78,7 @@ def _encoder_heading_change(left_cm, right_cm):
     return raw_angle / factor
 
 
-def _update_odometer_locked():
+def update_odometer_locked():
     global x, y, theta, _last_left, _last_right
     global _left_distance, _right_distance, _travel
     cur_left = left_motor.get_encoder()
@@ -98,7 +90,7 @@ def _update_odometer_locked():
     _right_distance += dr
     _travel += (abs(dl) + abs(dr)) / 2.0
     center = (dl + dr) / 2.0
-    turn = _encoder_heading_change(dl, dr)
+    turn = encoder_heading_change(dl, dr)
     mid = math.radians(theta + turn / 2.0)
     x += center * math.sin(mid)
     y += center * math.cos(mid)
@@ -106,9 +98,8 @@ def _update_odometer_locked():
 
 
 def update_odometer():
-    # Encoder reads and pose updates share the lock with line corrections.
     with _odo_lock:
-        _update_odometer_locked()
+        update_odometer_locked()
 
 
 def motion_state():
@@ -124,13 +115,13 @@ def float_motors():
         time.sleep(0.01)
 
 
-def _odometer_loop():
+def odometer_loop():
     while not _shutdown.is_set():
         update_odometer()
         time.sleep(LOOP_SECONDS)
 
 
-def _display_loop():
+def display_loop():
     while not _shutdown.is_set():
         px, py, heading = motion_state()[:3]
         print("x: %7.2f  y: %7.2f  theta: %6.1f  RGB L: %s R: %s"
@@ -145,14 +136,13 @@ def read_light(sensor):
     return total
 
 
-def _on_line(sensor):
+def on_line(sensor):
     total = read_light(sensor)
     white = WHITE_LEFT if sensor is left_light else WHITE_RIGHT
     return None if total is None else total < white - LINE_DROP
 
 
 class LineGate:
-    """A cooldown, a minimum distance, and a white-floor rearm condition."""
     def __init__(self):
         self.reset()
 
@@ -178,15 +168,10 @@ class LineGate:
         self.armed = False
 
 
-_line_gate = LineGate()  # Persists between drive_forward calls and square sides.
+_line_gate = LineGate()
 
 
 class BalanceSample:
-    """Estimate motor strength from encoder travel per power-second.
-
-    The heading controller varies power, so arrival times alone cannot give
-    the strength ratio. Only sample forward motion before either wheel stops.
-    """
     def __init__(self, state, now):
         self.last_state = state
         self.last_time = now
@@ -212,16 +197,16 @@ class BalanceSample:
         return max(1.0 / MAX_STRENGTH_RATIO, min(MAX_STRENGTH_RATIO, ratio))
 
 
-def _stop():
+def stop():
     left_motor.set_power(0)
     right_motor.set_power(0)
 
 
-def _heading_error(target):
+def heading_error(target):
     return ((target - motion_state()[2] + 180.0) % 360.0) - 180.0
 
 
-def _base_powers():
+def base_powers():
     left = right = float(DRIVE_POWER)
     if _strength_ratio >= 1.0:
         right *= 1.0 + CORRECTION_MULTIPLIER * (_strength_ratio - 1.0)
@@ -230,10 +215,10 @@ def _base_powers():
     return left, right
 
 
-def _drive_powers(target_heading):
-    left, right = _base_powers()
+def drive_powers(target_heading):
+    left, right = base_powers()
     corr = max(-MAX_CORRECTION, min(MAX_CORRECTION,
-                                  HEADING_KP * _heading_error(target_heading)))
+                                  HEADING_KP * heading_error(target_heading)))
     powers = (int(round(max(0, min(100, left + corr)))),
               int(round(max(0, min(100, right - corr)))))
     left_motor.set_power(powers[0])
@@ -241,11 +226,10 @@ def _drive_powers(target_heading):
     return powers
 
 
-def _snap_to_line(target_heading, line):
+def snap_to_line(target_heading, line):
     global x, y, theta
     with _odo_lock:
-        # Consume the final alignment movement before replacing the pose.
-        _update_odometer_locked()
+        update_odometer_locked()
         h = int(round(target_heading)) % 360
         sign = 1 if h in (0, 90) else -1
         if h in (0, 180):
@@ -256,7 +240,6 @@ def _snap_to_line(target_heading, line):
 
 
 def drive_forward(distance, target_heading=None, light_correction=True):
-    """Drive cm while holding a heading; line alignment is for grid legs only."""
     global _strength_ratio
     if distance < 0:
         raise ValueError("drive_forward requires a nonnegative distance")
@@ -278,14 +261,13 @@ def drive_forward(distance, target_heading=None, light_correction=True):
     line = None
 
     try:
-        powers = _drive_powers(target_heading) if distance > 0 else (0, 0)
+        powers = drive_powers(target_heading) if distance > 0 else (0, 0)
         while distance > 0:
             state = motion_state()
             now = time.monotonic()
             aligning = left_hit or right_hit
             if not aligning:
                 sample.add(state, now, powers)
-                # A fixed endpoint survives odometer position corrections.
                 progress = ((state[0] - start_x) * math.sin(heading_rad)
                             + (state[1] - start_y) * math.cos(heading_rad))
                 if progress >= distance:
@@ -293,7 +275,7 @@ def drive_forward(distance, target_heading=None, light_correction=True):
             if now - started >= MOTION_TIMEOUT_SECONDS:
                 raise RuntimeError("Forward movement timed out")
 
-            l_on, r_on = ((_on_line(left_light), _on_line(right_light))
+            l_on, r_on = ((on_line(left_light), on_line(right_light))
                           if light_correction else (False, False))
             if (light_correction and not aligning
                     and _line_gate.accept(l_on, r_on, now, state[5])):
@@ -309,44 +291,37 @@ def drive_forward(distance, target_heading=None, light_correction=True):
                     left_hit = True
                 if r_on is True:
                     right_hit = True
-                # Keep the first wheel stopped; do not let heading feedback
-                # restart it while the second sensor catches up.
-                left_motor.set_power(0 if left_hit else int(round(_base_powers()[0])))
-                right_motor.set_power(0 if right_hit else int(round(_base_powers()[1])))
+                left_motor.set_power(0 if left_hit else int(round(base_powers()[0])))
+                right_motor.set_power(0 if right_hit else int(round(base_powers()[1])))
                 if left_hit and right_hit:
-                    _stop()
+                    stop()
                     time.sleep(0.05)
-                    _snap_to_line(target_heading, line)
+                    snap_to_line(target_heading, line)
                     state = motion_state()
                     _strength_ratio = sample.estimate(_strength_ratio)
                     _line_gate.crossed(time.monotonic(), state[5])
                     print("Line aligned; left/right strength: %.3f" % _strength_ratio)
                     left_hit = right_hit = False
                     sample = BalanceSample(state, time.monotonic())
-                    powers = _drive_powers(target_heading)
+                    powers = drive_powers(target_heading)
                 elif (now - align_started >= ALIGN_TIMEOUT_SECONDS
                       or max(abs(state[3] - first_state[3]),
                              abs(state[4] - first_state[4])) > MAX_HIT_GAP):
                     raise RuntimeError("Second light sensor did not reach the line")
             else:
-                powers = _drive_powers(target_heading)
+                powers = drive_powers(target_heading)
             time.sleep(LOOP_SECONDS)
     finally:
-        _stop()
+        stop()
 
 
 def turn_by(angle):
-    """Turn by a signed angle using relative encoder movement.
-
-    Positive is right/clockwise. The turn's direction and progress do not
-    depend on the absolute heading or its 180/360-degree wrap boundaries.
-    """
     requested_angle = angle
     angle = ((angle + 180.0) % 360.0) - 180.0
     if angle == -180.0 and requested_angle > 0:
         angle = 180.0
     if abs(angle) <= 1.0:
-        _stop()
+        stop()
         return
     update_odometer()
     start = motion_state()
@@ -358,16 +333,14 @@ def turn_by(angle):
         right_motor.set_power(-sign * TURN_POWER)
         while True:
             state = motion_state()
-            turned = _encoder_heading_change(state[3] - start[3], state[4] - start[4])
+            turned = encoder_heading_change(state[3] - start[3], state[4] - start[4])
             if turned * sign >= abs(angle) - 1.0:
                 break
             if time.monotonic() - started >= MOTION_TIMEOUT_SECONDS:
                 raise RuntimeError("Turn timed out")
             time.sleep(0.005)
     finally:
-        _stop()
-        # A sensor may sweep across a line during a turn. Rearm on white
-        # floor during the next forward leg before accepting any crossing.
+        stop()
         _line_gate.armed = False
     print("Turn %s: encoder rotation %.1f deg; heading %.1f deg"
           % ("RIGHT" if sign > 0 else "LEFT", turned, motion_state()[2]))
@@ -379,21 +352,17 @@ def square_driver():
         time.sleep(0.2)
         print("Corner %d/4: RIGHT 90 deg; starting heading %.1f deg"
               % (side + 1, motion_state()[2]))
-        # This route always turns right. An inaccurate absolute heading must
-        # never turn a square corner into a shortest-path left turn.
         turn_by(90)
         time.sleep(0.2)
-    _stop()
+    stop()
     print("FINAL x: %.2f y: %.2f theta: %.1f" % motion_state()[:3])
 
 
 def turn_to_heading(target_heading):
-    """Face an absolute heading with the smallest signed turn (at most 180)."""
-    turn_by(_heading_error(target_heading % 360.0))
+    turn_by(heading_error(target_heading % 360.0))
 
 
 def travel_to_safest(target_x, target_y):
-    """Coordinates are cm. Move on one axis at a time, using light correction."""
     for axis in AXIS_ORDER:
         state = motion_state()
         remaining = (target_x - state[0]) if axis == "x" else (target_y - state[1])
@@ -404,8 +373,6 @@ def travel_to_safest(target_x, target_y):
         else:
             heading = 0.0 if remaining > 0 else 180.0
         turn_to_heading(heading)
-        # Unequal motors can shift the axle slightly during an in-place turn.
-        # Recalculate the remaining axis distance from the pose after turning.
         state = motion_state()
         remaining = (target_x - state[0]) if axis == "x" else (target_y - state[1])
         if abs(remaining) <= POSITION_TOLERANCE_CM:
@@ -421,7 +388,6 @@ def travel_to_safest(target_x, target_y):
 
 
 def travel_to_shortest(target_x, target_y):
-    """Drive a direct segment, without applying axis-based light corrections."""
     state = motion_state()
     dx, dy = target_x - state[0], target_y - state[1]
     if math.hypot(dx, dy) <= POSITION_TOLERANCE_CM:
@@ -438,7 +404,6 @@ def travel_to_shortest(target_x, target_y):
 
 
 def validate_navigation():
-    """Validate the whole route before any movement starts."""
     if NAVIGATION_MODE not in ("safest", "shortest"):
         raise ValueError("NAVIGATION_MODE must be safest or shortest")
     if tuple(AXIS_ORDER) not in (("x", "y"), ("y", "x")):
@@ -454,7 +419,6 @@ def validate_navigation():
 
 
 def navigate_waypoints():
-    """Visit the one shared waypoint list in order, converting tiles to cm."""
     validate_navigation()
     travel_to = travel_to_safest if NAVIGATION_MODE == "safest" else travel_to_shortest
     try:
@@ -469,7 +433,7 @@ def navigate_waypoints():
                   % (px, py, heading, error))
         print("Navigation complete.")
     finally:
-        _stop()
+        stop()
 
 
 if __name__ == "__main__":
@@ -482,15 +446,15 @@ if __name__ == "__main__":
         print("LAB 3 %s: start at (0, 0), facing +y; RGB white L=%s R=%s"
               % (NAVIGATION_MODE, WHITE_LEFT, WHITE_RIGHT))
         time.sleep(1)
-        workers = [Thread(target=_display_loop, daemon=True)]
-        workers.append(Thread(target=_odometer_loop, daemon=True))
+        workers = [Thread(target=display_loop, daemon=True)]
+        workers.append(Thread(target=odometer_loop, daemon=True))
         for worker in workers:
             worker.start()
         navigate_waypoints()
     except KeyboardInterrupt:
         pass
     finally:
-        _stop()
+        stop()
         _shutdown.set()
         for worker in workers:
             worker.join(timeout=1.0)
