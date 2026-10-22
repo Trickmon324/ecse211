@@ -80,8 +80,9 @@ TURN_MIN_POWER = 14  # Lowest power that still reliably turns the robot
 TURN_RAMP_DEG = 10.0  # Ramp up from min to full power over the first degrees
 TURN_SLOW_DEG = 40.0  # Start slowing down within this many degrees
 TURN_TOLERANCE_DEG = 0.5  # Acceptable final heading error
-TURN_COAST_DEG = 1.5  # Initial guess of how far the robot keeps turning after
-                      # power is cut; re-learned from every turn automatically
+TURN_COAST_SECONDS = 0.05  # Initial guess of the coast time after power is cut:
+                           # coast (deg) = turning speed (deg/s) * this. Re-learned
+                           # from every turn, so fast (big) turns cut power earlier
 TURN_NUDGE_POWER = 16  # Power of the short touch-up pulses after a turn
 TURN_NUDGE_SECONDS = 0.04  # Length of one touch-up pulse
 TURN_MAX_NUDGES = 12  # Max touch-up pulses per turn
@@ -100,7 +101,13 @@ DISTANCE_NO_LOOKING_FOR_LINE = 15.0
 # Alignment constraints
 PERP_LINE_TOLERANCE_CM = 4.0  # Tolerance window around expected grid line
 ALIGN_POWER = 15  # Power of the trailing wheel while squaring up on a line
-MAX_ALIGN_PIVOT_DEG = 12.0  # Bigger pivot than this = false line, abort
+MAX_ALIGN_PIVOT_DEG = 3.5  # Bigger pivot (~5.5 deg real tilt) = false line, abort.
+                           # Calibrated turns are within ~1 deg, so a bigger tilt
+                           # means one sensor stopped on a smudge, not a line
+LINE_CONFIRM_SAMPLES = 2  # Consecutive dark readings needed to count as a line
+                          # (one glitchy reading no longer stops a wheel)
+ALIGN_CONFIRM_FIRST_SENSOR = True  # When the 2nd sensor finds the line, the 1st
+                                   # must still read dark, else it was a false hit
 APPLY_LATERAL_DRIFT = True  # Correct cross-track coord from the approach angle
 MAX_LATERAL_DRIFT_CM = 3.0  # Clamp on a single lateral drift correction
 # Squaring up pivots about the STOPPED wheel, which drags the first sensor
@@ -217,9 +224,11 @@ def display_loop():
 # LIGHT SENSORS
 # =======================================================================
 def read_light(sensor):
-    """Reads color sensor total RGB intensity."""
+    """Reads color sensor total RGB intensity (None if the reading is invalid)."""
     rgb = sensor.get_value()
     total = sum(rgb[:3]) if rgb is not None and len(rgb) >= 3 else None
+    if total is not None and total <= 0:
+        total = None  # All-zero = failed read, not a black line
     last_light["L" if sensor is left_light else "R"] = total
     return total
 
@@ -368,6 +377,7 @@ def drive_to(target_x, target_y, heading, light_correction=True):
     segment_start_fwd = forward_coord(state)
     current_base_power = float(START_POWER)
     align = None  # Alignment bookkeeping while squaring up on a line
+    dark_count = {"L": 0, "R": 0}  # Consecutive dark readings per sensor
 
     try:
         while True:
@@ -381,12 +391,16 @@ def drive_to(target_x, target_y, heading, light_correction=True):
             if align is None and along <= 0:
                 break
 
-            l_on = r_on = False
+            l_raw = r_raw = False
             can_look = (light_correction and line_gate.ready(now)
                         and state[5] - travel_at_last_line >= DISTANCE_NO_LOOKING_FOR_LINE)
             if align is not None or can_look:
-                l_on = bool(on_line(left_light))
-                r_on = bool(on_line(right_light))
+                l_raw = bool(on_line(left_light))
+                r_raw = bool(on_line(right_light))
+            dark_count["L"] = dark_count["L"] + 1 if l_raw else 0
+            dark_count["R"] = dark_count["R"] + 1 if r_raw else 0
+            l_on = dark_count["L"] >= LINE_CONFIRM_SAMPLES
+            r_on = dark_count["R"] >= LINE_CONFIRM_SAMPLES
 
             # --------------------------------------------------------------
             # Cross-line hit near an expected grid line: start alignment
@@ -397,6 +411,7 @@ def drive_to(target_x, target_y, heading, light_correction=True):
                 if abs(sensor_coord - nearest_perp) <= PERP_LINE_TOLERANCE_CM:
                     align = {
                         "L": l_on, "R": r_on,
+                        "first": None if (l_on and r_on) else ("L" if l_on else "R"),
                         "line": nearest_perp,
                         "theta": state[2],
                         "time": now,
@@ -420,18 +435,36 @@ def drive_to(target_x, target_y, heading, light_correction=True):
                 left_motor.set_power(0 if align["L"] else ALIGN_POWER)
                 right_motor.set_power(0 if align["R"] else ALIGN_POWER)
                 pivot = wrap180(state[2] - align["theta"])
+                first_lost = (ALIGN_CONFIRM_FIRST_SENSOR and align["first"] is not None
+                              and not (l_raw if align["first"] == "L" else r_raw))
 
-                if align["L"] and align["R"]:
+                if align["L"] and align["R"] and first_lost:
+                    # The first "line" was a smudge or bad reading: the robot is
+                    # NOT square, so don't snap. The odometer tracked the pivot,
+                    # so the heading controller can steer it back. No cooldown:
+                    # the sensor that just arrived IS on the real line, so the
+                    # next loop starts a fresh alignment from it.
+                    print("--> Alignment rejected: %s sensor was not really on a line."
+                          % ("Left" if align["first"] == "L" else "Right"))
+                    align = None
+                    current_base_power = float(START_POWER)
+
+                elif align["L"] and align["R"]:
                     stop()
                     time.sleep(0.05)
                     pivot = wrap180(motion_state()[2] - align["theta"])
-                    drift = snap_to_line(heading, align["line"], pivot, align["leg_distance"])
-                    print("--> Line at %.1f cm: approach angle = %+.1f deg, lateral drift = %+.2f cm"
-                          % (align["line"], -pivot * (1.0 + ALIGN_LEVER_RATIO), drift))
+                    if abs(pivot) > MAX_ALIGN_PIVOT_DEG:
+                        # Final pivot (incl. coasting) too big: false line, don't snap
+                        print("--> Alignment rejected: pivot %.1f deg is too big for a real line."
+                              % pivot)
+                    else:
+                        drift = snap_to_line(heading, align["line"], pivot, align["leg_distance"])
+                        print("--> Line at %.1f cm: approach angle = %+.1f deg, lateral drift = %+.2f cm"
+                              % (align["line"], -pivot * (1.0 + ALIGN_LEVER_RATIO), drift))
+                        state = motion_state()
+                        travel_at_last_line = state[5]
+                        segment_start_fwd = forward_coord(state)
 
-                    state = motion_state()
-                    travel_at_last_line = state[5]
-                    segment_start_fwd = forward_coord(state)
                     line_gate.crossed(time.monotonic())
                     align = None
                     current_base_power = float(START_POWER)  # Soft-start resume
@@ -475,8 +508,8 @@ def drive_leg(target_x, target_y, heading, light_correction):
         settle_on_target(target_x, target_y, heading)
 
 
-# Learned coast (deg the robot keeps turning after power is cut), per direction
-turn_coast = {1: TURN_COAST_DEG, -1: TURN_COAST_DEG}
+# Learned coast time (s) per direction: coast (deg) = turning speed * coast time
+turn_coast_time = {1: TURN_COAST_SECONDS, -1: TURN_COAST_SECONDS}
 
 
 def turn_by(angle):
@@ -484,8 +517,9 @@ def turn_by(angle):
     Turns in place by 'angle' degrees (positive = clockwise/right).
     No modulo wrap-around: turning 360 degrees turns a complete circle.
       1. Ramps power up (no wheel slip on start) and down (less momentum).
-      2. Cuts power early by the learned coast so the robot coasts ONTO the
-         target instead of past it. Reversing to fix an overshoot is avoided
+      2. Cuts power early by the predicted coast (measured turning speed x
+         learned coast time) so the robot coasts ONTO the target instead of
+         past it. A fast, big turn coasts further, so it cuts power earlier. Reversing to fix an overshoot is avoided
          because gear backlash eats part of a reverse correction: the encoders
          count it, but the wheels barely move.
       3. Short touch-up pulses fix whatever error is left.
@@ -508,18 +542,28 @@ def turn_by(angle):
     start_state = motion_state()
 
     def turned():
+        update_odometer()  # Fresh reading; the odometer thread can be 10 ms stale
         s = motion_state()
         return encoder_heading_change(s[3] - start_state[3], s[4] - start_state[4])
 
-    lead = turn_coast[sign]
+    coast_time = turn_coast_time[sign]
     started = time.monotonic()
     try:
         # --- Main turn ------------------------------------------------------
         powered = False
+        samples = []  # (time, turned) over the last 50 ms, for the turning speed
+        speed = 0.0
         while True:
-            done = turned() * sign
+            now = time.monotonic()
+            t_now = turned()
+            samples.append((now, t_now))
+            while len(samples) > 2 and now - samples[0][0] > 0.05:
+                samples.pop(0)
+            if now > samples[0][0]:
+                speed = abs(t_now - samples[0][1]) / (now - samples[0][0])
+            done = t_now * sign
             remaining = abs(goal) - done
-            if remaining <= lead:
+            if remaining <= speed * coast_time:
                 break
             if time.monotonic() - started >= MOTION_TIMEOUT_SECONDS:
                 raise RuntimeError("Turn timed out")
@@ -536,9 +580,9 @@ def turn_by(angle):
         # Settle delay: ensures gear train and motor inertia settle completely
         time.sleep(TURN_SETTLE_SECONDS)
         coast = (turned() - cut_at) * sign
-        if powered and abs(goal) > lead + 5.0:
-            # Learn the coast so the next turn cuts power at the right moment
-            turn_coast[sign] = max(0.0, min(15.0, 0.5 * lead + 0.5 * coast))
+        if powered and speed > 10.0 and abs(goal) > 10.0:
+            # Learn the coast time so the next turn cuts power at the right moment
+            turn_coast_time[sign] = max(0.0, min(0.3, 0.5 * coast_time + 0.5 * coast / speed))
 
         # --- Touch-up pulses -------------------------------------------------
         # Pulse length adapts: longer if a pulse barely moved the robot (static
@@ -682,14 +726,17 @@ def square_up_on_line():
     Returns the pivot (deg) it needed: the robot's real heading error was -pivot.
     """
     hits = {"L": False, "R": False}
+    dark_count = {"L": 0, "R": 0}
     theta_first = None
     started = time.monotonic()
     try:
         while not (hits["L"] and hits["R"]):
             if time.monotonic() - started >= 10.0:
                 raise RuntimeError("No line found while squaring up")
-            l_on = bool(on_line(left_light))
-            r_on = bool(on_line(right_light))
+            dark_count["L"] = dark_count["L"] + 1 if on_line(left_light) else 0
+            dark_count["R"] = dark_count["R"] + 1 if on_line(right_light) else 0
+            l_on = dark_count["L"] >= LINE_CONFIRM_SAMPLES
+            r_on = dark_count["R"] >= LINE_CONFIRM_SAMPLES
             if theta_first is None and (l_on or r_on):
                 theta_first = motion_state()[2]
             hits["L"] = hits["L"] or l_on
@@ -787,7 +834,7 @@ def calibrate_turn_routine():
         print("  Error = %+.2f deg + %+.3f%% of the angle" % (b, 100.0 * k))
         print("  Set %s_TURN_OFFSET_DEG = %.2f   (currently %.2f)"
               % (name, offset * (1.0 + k) - b, offset))
-        print("  Learned coast: %.2f deg" % turn_coast[sign])
+        print("  Learned coast time: %.3f s (set TURN_COAST_SECONDS to this)" % turn_coast_time[sign])
 
     if slopes:
         k = sum(slopes) / len(slopes)
