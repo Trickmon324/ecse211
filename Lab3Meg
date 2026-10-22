@@ -10,52 +10,59 @@ from utils.brick import Motor, EV3ColorSensor, wait_ready_sensors, reset_brick
 # =======================================================================
 # RUN_MODE options:
 #   "navigate"       -> Runs Lab 3 waypoint navigation
-#   "calibrate_turn" -> Runs in-place turn test to tune turn factors
+#   "calibrate_turn" -> Turns in place to tune turn factors
 #   "float"          -> Floats motors for TA manual check
 RUN_MODE = "navigate"
 
 # Navigation settings
-NAVIGATION_MODE = "safest"        # "safest" or "shortest"
-WAYPOINTS = [(2, 1), (1, 1), (1, 2), (2, 0)]  # Waypoints in tile units (x, y)
-AXIS_ORDER = ("x", "y")           # For safest path: ("x", "y") or ("y", "x")
-POSITION_TOLERANCE_CM = 0.5       # Stop tolerance at waypoints
+NAVIGATION_MODE = "shortest"  # "safest" or "shortest"
+WAYPOINTS = [(1, 2), (2, 2), (1, 1), (2, 0)]  # Waypoints in tile units (x, y)
+AXIS_ORDER = ("x", "y")  # For safest path: ("x", "y") or ("y", "x")
+POSITION_TOLERANCE_CM = 0.5  # Stop tolerance at waypoints
 
 # Turn Calibration settings (used when RUN_MODE = "calibrate_turn")
-CALIBRATE_DIRECTION = "both"      # "right", "left", or "both"
-CALIBRATE_ANGLE = 360.0           # 360 deg gives the most accurate calibration
+CALIBRATE_DIRECTION = "both"  # "right", "left", or "both"
+CALIBRATE_ANGLE = 360.0  # 360 deg gives the most accurate calibration
 
 # =======================================================================
 # ROBOT CONSTANTS & TUNING PARAMETERS
 # =======================================================================
-WHEEL_RADIUS = 2.1                # Wheel radius in cm
-TRACK_WIDTH = 13.5                # Distance between wheel centerlines in cm
+WHEEL_RADIUS = 2.1  # Wheel radius in cm
+TRACK_WIDTH = 13.5  # Distance between wheel centerlines in cm
 
 # Turn correction factors:
 # If robot under-turns, DECREASE factor. If it over-turns, INCREASE factor.
-RIGHT_TURN_FACTOR = 1.08
-LEFT_TURN_FACTOR = 1.04651
+RIGHT_TURN_FACTOR = 1.03 # 1.03
+LEFT_TURN_FACTOR = 1.03 # 1.04
 
-SENSOR_OFFSET = 4.0               # Distance from wheel axle to light sensors (cm)
-SENSOR_SEPARATION = 6.3           # Distance between the two light sensors (cm)
-TILE = 30.48                      # Standard tile dimension in cm
+SENSOR_OFFSET = 4.0  # Distance from wheel axle to light sensors (cm)
+SENSOR_SEPARATION = 6.3  # Distance between the two light sensors (cm)
+TILE = 30.48  # Standard tile dimension in cm
 
-START_X = 0.0                     # Origin x in cm
-START_Y = 0.0                     # Origin y in cm
-START_THETA = 0.0                 # Facing +y direction (0 degrees)
+START_X = 0.0  # Origin x in cm
+START_Y = 0.0  # Origin y in cm
+START_THETA = 0.0  # Facing +y direction (0 degrees)
 
-DRIVE_POWER = 15                  # Forward cruising power
-TURN_POWER = 22                   # Turning power
-HEADING_KP = 1.4                  # Proportional heading correction gain
-MAX_CORRECTION = 8                # Max differential motor power trim
+DRIVE_POWER = 15  # Forward cruising power
+START_POWER = 8  # Gentle starting power (prevents gear surge)
+ACCEL_STEP = 0.1  # Power increase per loop iteration (ramp-up)
+TURN_POWER = 22  # Turning power
+HEADING_KP = 1.4  # Heading correction gain
+CROSS_TRACK_KP = 1.8  # Cross-track drift recovery gain
+MAX_CORRECTION = 8  # Max differential motor power trim
 
 # Light sensor thresholds (White board vs Dark tape)
-WHITE_LEFT = 350
-WHITE_RIGHT = 400
-LINE_DROP = 140
+WHITE_LEFT = 380
+WHITE_RIGHT = 370
+LINE_DROP = 200
 
-# Spatial & Alignment constraints
-PERP_LINE_TOLERANCE_CM = 3.5      # Max distance from expected cross-line to arm
-MAX_ALIGN_TRAVEL = 2.5            # Max travel allowed between sensor 1 & 2 hits
+# --- BUFFER DISTANCE ---
+# Trust encoders only; do NOT check for line drops until this distance has elapsed
+DISTANCE_NO_LOOKING_FOR_LINE = 15.0
+
+# Alignment constraints
+PERP_LINE_TOLERANCE_CM = 4.0  # Tolerance window around expected grid line
+MAX_ALIGN_TRAVEL = 100000000  # Max travel allowed between sensor 1 & 2 hits
 LINE_COOLDOWN_SECONDS = 0.8
 ALIGN_TIMEOUT_SECONDS = 3.0
 MOTION_TIMEOUT_SECONDS = 60.0
@@ -181,23 +188,18 @@ def on_line(sensor):
 
 class LineGate:
     """Manages cooldown and state transitions for perpendicular line detections."""
+
     def __init__(self):
         self.reset()
 
     def reset(self):
         self.ready_at = 0.0
-        self.last_travel = None
 
-    def ready(self, now, current_travel):
-        if now < self.ready_at:
-            return False
-        if self.last_travel is not None and (current_travel - self.last_travel < 15.0):
-            return False
-        return True
+    def ready(self, now):
+        return now >= self.ready_at
 
-    def crossed(self, now, current_travel):
+    def crossed(self, now):
         self.ready_at = now + LINE_COOLDOWN_SECONDS
-        self.last_travel = current_travel
 
 
 line_gate = LineGate()
@@ -213,37 +215,48 @@ def heading_error(target):
     return ((target - motion_state()[2] + 180.0) % 360.0) - 180.0
 
 
-def drive_powers(target_heading, bias=0):
-    """Calculates P-controlled motor powers, with optional steering bias."""
+def drive_powers(target_heading, base_power, bias=0):
+    """Calculates P-controlled motor powers, with soft-start base power and steering bias."""
     err = heading_error(target_heading)
     corr = max(-MAX_CORRECTION, min(MAX_CORRECTION, HEADING_KP * err + bias))
-    p_left = int(round(max(0, min(100, DRIVE_POWER + corr))))
-    p_right = int(round(max(0, min(100, DRIVE_POWER - corr))))
+    p_left = int(round(max(0, min(100, base_power + corr))))
+    p_right = int(round(max(0, min(100, base_power - corr))))
     left_motor.set_power(p_left)
     right_motor.set_power(p_right)
     return p_left, p_right
 
 
-def snap_to_line(target_heading, line_coord):
-    """Corrects odometer coordinate and heading when crossing a verified perpendicular line."""
+def snap_to_line(target_heading, line_coord, lateral_drift=0.0):
+    """
+    Corrects forward coordinate to the line, applies calculated lateral drift
+    to the cross-track coordinate, and resets theta to the exact grid heading.
+    """
     global x, y, theta
     with odo_lock:
         update_odometer_locked()
         h = int(round(target_heading)) % 360
         sign = 1 if h in (0, 90) else -1
+
         if h in (0, 180):
+            # Forward is Y; Cross is X
             y = line_coord - sign * SENSOR_OFFSET
+            # Update X with the calculated lateral displacement
+            x += lateral_drift
         else:
+            # Forward is X; Cross is Y
             x = line_coord - sign * SENSOR_OFFSET
+            # Update Y with the calculated lateral displacement
+            y += lateral_drift
+
         theta = float(h)
 
 
 def drive_forward(distance, target_heading=None, light_correction=True):
     """
-    Drives forward a specified distance with gyro/encoder heading control.
-    In Safest mode (light_correction=True):
-      - Uses lane-centering if drifting onto longitudinal line.
-      - Triggers perpendicular alignment ONLY when near an integer grid cross-line.
+    Drives forward a specified distance with:
+      1. Soft-start acceleration ramp (eliminates startup motor boost & backlash jerk).
+      2. Distance buffer (suppresses false positives early in the tile).
+      3. Cross-track drift detection & correction from two-sensor hit differential.
     """
     if distance <= 0:
         return
@@ -258,16 +271,25 @@ def drive_forward(distance, target_heading=None, light_correction=True):
     h_int = int(round(target_heading)) % 360
     is_y_axis = h_int in (0, 180)
     fwd_sign = 1 if h_int in (0, 90) else -1
+    nominal_cross = round(start_x / TILE) * TILE if is_y_axis else round(start_y / TILE) * TILE
 
     started = time.monotonic()
     left_hit = right_hit = False
+    first_hit = None
+    first_hit_travel = 0.0
     aligning = False
     align_start_time = 0.0
     align_start_travel = 0.0
     target_line = None
 
+    # Track travel since start of movement or since last line
+    travel_at_last_line = state[5]
+    segment_start_travel = state[5]
+
+    # Soft-start power variable
+    current_base_power = float(START_POWER)
+
     try:
-        drive_powers(target_heading)
         while True:
             state = motion_state()
             now = time.monotonic()
@@ -275,16 +297,23 @@ def drive_forward(distance, target_heading=None, light_correction=True):
             if now - started >= MOTION_TIMEOUT_SECONDS:
                 raise RuntimeError("Forward movement timed out")
 
-            # Check distance traveled along target vector
+            # Smoothly ramp up power to eliminate initial jerk
+            if current_base_power < DRIVE_POWER:
+                current_base_power = min(float(DRIVE_POWER), current_base_power + ACCEL_STEP)
+
             progress = ((state[0] - start_x) * math.sin(heading_rad)
                         + (state[1] - start_y) * math.cos(heading_rad))
             if not aligning and progress >= distance:
                 break
 
-            l_on = on_line(left_light) if light_correction else False
-            r_on = on_line(right_light) if light_correction else False
+            # Distance traveled since we last started or aligned with a line
+            dist_since_last_line = state[5] - travel_at_last_line
+            can_look_for_line = (dist_since_last_line >= DISTANCE_NO_LOOKING_FOR_LINE)
 
-            # Distance from front sensors to nearest expected perpendicular line
+            l_on = on_line(left_light) if (light_correction and can_look_for_line) else False
+            r_on = on_line(right_light) if (light_correction and can_look_for_line) else False
+
+            # Distance to expected perpendicular line
             curr_coord = state[1] if is_y_axis else state[0]
             sensor_coord = curr_coord + fwd_sign * SENSOR_OFFSET
             nearest_perp = round(sensor_coord / TILE) * TILE
@@ -293,63 +322,103 @@ def drive_forward(distance, target_heading=None, light_correction=True):
             near_perp_line = (dist_to_perp <= PERP_LINE_TOLERANCE_CM)
 
             if light_correction and not aligning:
-                # ----------------------------------------------------
-                # CASE 1: At a true perpendicular intersection
-                # ----------------------------------------------------
-                if near_perp_line and (l_on or r_on) and line_gate.ready(now, state[5]):
+                # ------------------------------------------------------------------
+                # Cross-line hit: Trigger alignment
+                # ------------------------------------------------------------------
+                if can_look_for_line and near_perp_line and (l_on or r_on) and line_gate.ready(now):
                     aligning = True
                     align_start_time = now
                     align_start_travel = state[5]
+                    first_hit_travel = state[5]
                     target_line = nearest_perp
+
                     left_hit = bool(l_on)
                     right_hit = bool(r_on)
+                    first_hit = "L" if l_on else "R"
 
-                # ----------------------------------------------------
-                # CASE 2: Far from intersection -> Longitudinal line drift!
-                # Keep robot centered between lines by steering gently.
-                # ----------------------------------------------------
-                elif not near_perp_line:
-                    steering_bias = 0
-                    if r_on and not l_on:
-                        steering_bias = 4   # Right sensor sees black -> steer right
-                    elif l_on and not r_on:
-                        steering_bias = -4  # Left sensor sees black -> steer left
-                    drive_powers(target_heading, bias=steering_bias)
+                # ------------------------------------------------------------------
+                # Mid-tile travel: Active lane-centering towards nominal centerline
+                # ------------------------------------------------------------------
+                else:
+                    current_cross = state[0] if is_y_axis else state[1]
+                    cross_error = current_cross - nominal_cross
 
-            # --------------------------------------------------------
-            # PERPENDICULAR ALIGNMENT PROTOCOL
-            # --------------------------------------------------------
+                    # Compute recovery bias (inverts depending on forward direction)
+                    if h_int == 0:  # North (+y): drift right (+x) -> steer left (-)
+                        steering_bias = -CROSS_TRACK_KP * cross_error
+                    elif h_int == 180:  # South (-y): drift right (+x) -> steer right (+)
+                        steering_bias = CROSS_TRACK_KP * cross_error
+                    elif h_int == 90:  # East (+x):  drift right (-y) -> steer left (-)
+                        steering_bias = CROSS_TRACK_KP * cross_error
+                    else:  # West (-x):  drift right (+y) -> steer right (+)
+                        steering_bias = -CROSS_TRACK_KP * cross_error
+
+                    drive_powers(target_heading, current_base_power, bias=steering_bias)
+
+            # ----------------------------------------------------------------------
+            # ALIGNMENT SEQUENCE & LATERAL DRIFT COMPUTATION
+            # ----------------------------------------------------------------------
             if aligning:
                 if l_on:
                     left_hit = True
                 if r_on:
                     right_hit = True
 
-                left_motor.set_power(0 if left_hit else DRIVE_POWER)
-                right_motor.set_power(0 if right_hit else DRIVE_POWER)
+                # Drive trailing motor until both sensors hit the line
+                left_motor.set_power(0 if left_hit else 15)
+                right_motor.set_power(0 if right_hit else 15)
 
-                # Both sensors have hit the perpendicular line
                 if left_hit and right_hit:
                     stop()
                     time.sleep(0.05)
-                    snap_to_line(target_heading, target_line)
+
+                    # 1. Calculate travel differential between the two sensor hits
+                    delta_s = max(0.0, state[5] - first_hit_travel)
+
+                    # 2. Calculate approach angle error (alpha)
+                    sin_alpha = min(1.0, max(-1.0, delta_s / SENSOR_SEPARATION))
+                    alpha_rad = math.asin(sin_alpha)
+                    if first_hit == "L":
+                        alpha_rad = alpha_rad  # Tilted left
+
+                    # 3. Calculate lateral drift accumulated across this tile
+                    tile_travel = max(10.0, state[5] - segment_start_travel)
+                    lateral_drift = tile_travel * math.sin(alpha_rad)
+
+                    # Map lateral drift sign to world (X, Y)
+                    if h_int == 180:
+                        drift_sign = 1.0
+                    elif h_int == 90:
+                        drift_sign = 1.0
+                    else:
+                        drift_sign = -1.0
+                    signed_lateral_drift = drift_sign * lateral_drift
+
+                    print("--> Perpendicular Line Reached: angle error = %+.1f deg, lateral drift = %+.2f cm"
+                          % (math.degrees(alpha_rad), signed_lateral_drift))
+
+                    # 4. Snap forward coord, update cross coord with drift, reset heading to grid
+                    snap_to_line(target_heading, target_line, lateral_drift=signed_lateral_drift)
+
                     state = motion_state()
-                    line_gate.crossed(now, state[5])
-                    print("--> Perpendicular line aligned at %.1f cm; odometer updated." % target_line)
+                    travel_at_last_line = state[5]
+                    segment_start_travel = state[5]
+                    line_gate.crossed(now)
+
                     aligning = False
                     left_hit = right_hit = False
-                    drive_powers(target_heading)
+                    current_base_power = float(START_POWER)  # Soft-start resume
+                    drive_powers(target_heading, current_base_power)
 
-                # Safeguard: if 2nd sensor doesn't hit within travel limit, abort alignment
                 elif ((now - align_start_time >= ALIGN_TIMEOUT_SECONDS)
                       or (state[5] - align_start_travel > MAX_ALIGN_TRAVEL)):
-                    print("--> Alignment aborted (likely false detection or line slant).")
+                    print("--> Alignment aborted (false line or slant). Resuming encoders.")
                     aligning = False
                     left_hit = right_hit = False
-                    drive_powers(target_heading)
+                    drive_powers(target_heading, current_base_power)
 
             elif not light_correction:
-                drive_powers(target_heading)
+                drive_powers(target_heading, current_base_power)
 
             time.sleep(LOOP_SECONDS)
     finally:
@@ -358,19 +427,17 @@ def drive_forward(distance, target_heading=None, light_correction=True):
 
 def turn_by(angle):
     """
-    Executes an in-place turn by 'angle' degrees.
-    Positive angle = clockwise (right), Negative angle = counterclockwise (left).
+    Turns in place by 'angle' degrees.
+    No modulo wrap-around: turning 360 degrees turns a complete circle.
+    Includes settling delay to prevent gear backlash on next forward start.
     """
-    target_turn = ((angle + 180.0) % 360.0) - 180.0
-    if target_turn == -180.0 and angle > 0:
-        target_turn = 180.0
-    if abs(target_turn) <= 0.8:
+    if abs(angle) <= 0.8:
         stop()
         return
 
     update_odometer()
     start_state = motion_state()
-    sign = 1 if target_turn > 0 else -1
+    sign = 1 if angle > 0 else -1
     started = time.monotonic()
 
     try:
@@ -380,24 +447,29 @@ def turn_by(angle):
             state = motion_state()
             turned = encoder_heading_change(state[3] - start_state[3],
                                             state[4] - start_state[4])
-            if turned * sign >= abs(target_turn) - 0.8:
+            if turned * sign >= abs(angle) - 0.8:
                 break
             if time.monotonic() - started >= MOTION_TIMEOUT_SECONDS:
                 raise RuntimeError("Turn timed out")
             time.sleep(0.005)
     finally:
         stop()
-        time.sleep(0.1)
+        # Settle delay: ensures gear train and motor inertia settle completely
+        time.sleep(0.15)
 
 
 def turn_to_heading(target_heading):
-    """Turns to an absolute compass heading using the minimal angle."""
+    """Turns to an absolute compass heading using the minimal angle (<= 180 deg)."""
     err = heading_error(target_heading)
     turn_by(err)
 
 
 def travel_to_safest(target_x, target_y):
-    """Travels along grid lines (x, then y or y, then x) using light correction."""
+    """
+    Travels along grid lines (x, then y or y, then x).
+    Any lateral drift captured by snap_to_line() automatically adjusts
+    the remaining distance on the orthogonal leg to reach the exact coordinate.
+    """
     for axis in AXIS_ORDER:
         state = motion_state()
         rem = (target_x - state[0]) if axis == "x" else (target_y - state[1])
@@ -419,7 +491,7 @@ def travel_to_safest(target_x, target_y):
 
 
 def travel_to_shortest(target_x, target_y):
-    """Travels in a direct straight line to the target using minimal angle turn."""
+    """Travels directly to the target using minimal angle turn."""
     state = motion_state()
     dx = target_x - state[0]
     dy = target_y - state[1]
@@ -427,11 +499,9 @@ def travel_to_shortest(target_x, target_y):
     if dist <= POSITION_TOLERANCE_CM:
         return
 
-    # Calculate compass heading: 0 = +y, 90 = +x
     target_heading = math.degrees(math.atan2(dx, dy)) % 360.0
     turn_to_heading(target_heading)
 
-    # Re-calculate after turn
     state = motion_state()
     dx = target_x - state[0]
     dy = target_y - state[1]
@@ -445,7 +515,7 @@ def travel_to_shortest(target_x, target_y):
 def calibrate_turn_routine():
     """
     Routine to calibrate RIGHT_TURN_FACTOR and LEFT_TURN_FACTOR.
-    Executes specified angle turn, pauses, and outputs tuning guidance.
+    Turns by CALIBRATE_ANGLE, stops, and outputs the tuning formula.
     """
     print("\n--- TURN CALIBRATION ROUTINE ---")
     print("Testing angle: %.1f deg" % CALIBRATE_ANGLE)
@@ -459,21 +529,23 @@ def calibrate_turn_routine():
     for name, angle, factor in directions:
         print("\nReady to turn %s by %.1f degrees in 2 seconds..." % (name, abs(angle)))
         time.sleep(2.0)
-        h_start = motion_state()[2]
+        start_state = motion_state()
         turn_by(angle)
-        h_end = motion_state()[2]
-        measured_turn = abs(((h_end - h_start + 180.0) % 360.0) - 180.0)
+        end_state = motion_state()
+
+        turned = abs(encoder_heading_change(end_state[3] - start_state[3],
+                                            end_state[4] - start_state[4]))
 
         print("--- %s TURN RESULTS ---" % name)
-        print("Odometer measured turn: %.1f deg" % measured_turn)
-        print("Please visually inspect the physical angle the robot turned.")
-        print("If physical turn < target: decrease %s_TURN_FACTOR" % name)
-        print("If physical turn > target: increase %s_TURN_FACTOR" % name)
-        print("Formula: New_Factor = Current_Factor * (Physical_Angle / %.1f)" % abs(angle))
-        print("Current %s_TURN_FACTOR = %.5f" % (name, factor))
+        print("Target angle: %.1f deg" % abs(angle))
+        print("Odometer reported rotation: %.1f deg" % turned)
+        print("Look at where the robot physically landed:")
+        print("  - If robot turned SHORT of target: DECREASE %s_TURN_FACTOR" % name)
+        print("  - If robot turned PAST target:     INCREASE %s_TURN_FACTOR" % name)
+        print("  Formula: new_factor = %.5f * (physical_angle / %.1f)" % (factor, abs(angle)))
         time.sleep(1.5)
 
-    print("\nCalibration routine finished.\n")
+    print("\nCalibration complete.\n")
 
 
 def navigate_waypoints():
@@ -535,3 +607,6 @@ if __name__ == "__main__":
         for w in workers:
             w.join(timeout=0.5)
         reset_brick()
+
+
+        #bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
