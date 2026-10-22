@@ -10,7 +10,8 @@ from utils.brick import Motor, EV3ColorSensor, wait_ready_sensors, reset_brick
 # =======================================================================
 # RUN_MODE options:
 #   "navigate"           -> Runs Lab 3 waypoint navigation
-#   "calibrate_turn"     -> Turns in place to tune RIGHT/LEFT_TURN_FACTOR
+#   "calibrate_turn"     -> Turns in place to tune RIGHT/LEFT_TURN_OFFSET_DEG
+#                           and TRACK_WIDTH
 #   "calibrate_straight" -> Drives straight (no light correction) to tune
 #                           WHEEL_RADIUS and RIGHT_WHEEL_SCALE
 #   "float"              -> Floats motors for TA manual check
@@ -27,9 +28,12 @@ SETTLE_AT_TARGET = True  # Creep forward/back after each leg to null overshoot
 # Start with the robot facing a black line, light sensors 2-5 cm before it.
 # The robot squares up on the line, turns, squares up again, and the pivot
 # needed the second time is the real turn error -> no protractor needed.
+# Two different angles separate the two kinds of error:
+#   error that stays the same  -> RIGHT/LEFT_TURN_OFFSET_DEG
+#   error that grows with angle -> TRACK_WIDTH
 CALIBRATE_DIRECTION = "both"  # "right", "left", or "both"
-CALIBRATE_ANGLE = 360.0  # Must be a multiple of 360 so the robot faces the line again
-CALIBRATE_REPEATS = 3  # Turns per direction; the suggested factor is the average
+CALIBRATE_ANGLES = (360.0, 720.0)  # Multiples of 360 so the robot faces the line again
+CALIBRATE_REPEATS = 3  # Turns per angle per direction (results are averaged)
 CALIBRATE_BACKUP_CM = 8.0  # How far to back off the line before each turn
 CALIBRATE_SQUARE_POWER = 12  # Slow power while squaring up on the line
 
@@ -41,12 +45,15 @@ CALIBRATE_DISTANCE_TILES = 3  # Drive this many tiles along +y
 # =======================================================================
 WHEEL_RADIUS = 2.1  # Wheel radius in cm (tune with "calibrate_straight")
 RIGHT_WHEEL_SCALE = 1.0  # Right wheel size relative to left (fixes curving)
-TRACK_WIDTH = 13.5  # Distance between wheel centerlines in cm
+TRACK_WIDTH = 13.5  # Distance between wheel centerlines in cm. Fixes turn
+                    # errors that GROW with the angle (tune with "calibrate_turn")
 
-# Turn correction factors (odometer heading = raw encoder heading / factor):
-# If robot UNDER-turns, INCREASE factor. If it OVER-turns, DECREASE factor.
-RIGHT_TURN_FACTOR = 1.03
-LEFT_TURN_FACTOR = 1.03
+# Turn offsets: a CONSTANT number of degrees added to every turn's target, no
+# matter how big the turn is (compensates e.g. the wheel that starts first after
+# a turn because of gear backlash). Positive = turn further.
+# The odometer does NOT count the offset, so the robot keeps it after the turn.
+RIGHT_TURN_OFFSET_DEG = 2.7  # ~ what the old 1.03 factor added on a 90 deg turn
+LEFT_TURN_OFFSET_DEG = 2.7
 
 SENSOR_OFFSET = 4.0  # Distance from wheel axle to light sensors (cm)
 SENSOR_SEPARATION = 6.3  # Distance between the two light sensors (cm)
@@ -139,10 +146,8 @@ def init_odometer():
 
 
 def encoder_heading_change(left_cm, right_cm):
-    """Calculates heading change from wheel travel using direction-specific factors."""
-    raw_angle = math.degrees((left_cm - right_cm) / TRACK_WIDTH)
-    factor = RIGHT_TURN_FACTOR if raw_angle >= 0 else LEFT_TURN_FACTOR
-    return raw_angle / factor
+    """Calculates heading change (deg) from wheel travel."""
+    return math.degrees((left_cm - right_cm) / TRACK_WIDTH)
 
 
 def update_odometer_locked():
@@ -484,11 +489,20 @@ def turn_by(angle):
          because gear backlash eats part of a reverse correction: the encoders
          count it, but the wheels barely move.
       3. Short touch-up pulses fix whatever error is left.
+      4. Adds the constant RIGHT/LEFT_TURN_OFFSET_DEG to the target, then removes
+         it from the odometer heading. The offset makes up for rotation the
+         encoders never see, so the odometer must believe the robot turned
+         exactly 'angle'; otherwise the heading controller would steer the
+         offset straight back out on the next drive.
     """
+    global theta
     sign = 1 if angle > 0 else -1
     if abs(angle) <= TURN_TOLERANCE_DEG:
         stop()
         return
+
+    offset = RIGHT_TURN_OFFSET_DEG if sign > 0 else LEFT_TURN_OFFSET_DEG
+    goal = angle + sign * offset  # What the encoders must measure
 
     update_odometer()
     start_state = motion_state()
@@ -504,7 +518,7 @@ def turn_by(angle):
         powered = False
         while True:
             done = turned() * sign
-            remaining = abs(angle) - done
+            remaining = abs(goal) - done
             if remaining <= lead:
                 break
             if time.monotonic() - started >= MOTION_TIMEOUT_SECONDS:
@@ -522,7 +536,7 @@ def turn_by(angle):
         # Settle delay: ensures gear train and motor inertia settle completely
         time.sleep(TURN_SETTLE_SECONDS)
         coast = (turned() - cut_at) * sign
-        if powered and abs(angle) > lead + 5.0:
+        if powered and abs(goal) > lead + 5.0:
             # Learn the coast so the next turn cuts power at the right moment
             turn_coast[sign] = max(0.0, min(15.0, 0.5 * lead + 0.5 * coast))
 
@@ -531,7 +545,7 @@ def turn_by(angle):
         # friction), shorter if it jumped past the target.
         pulse = TURN_NUDGE_SECONDS
         for _ in range(TURN_MAX_NUDGES):
-            remaining = angle - turned()
+            remaining = goal - turned()
             if abs(remaining) <= TURN_TOLERANCE_DEG:
                 break
             s = 1 if remaining > 0 else -1
@@ -540,16 +554,19 @@ def turn_by(angle):
             time.sleep(pulse)
             stop()
             time.sleep(0.08)
-            after = angle - turned()
+            after = goal - turned()
             if after * s < -TURN_TOLERANCE_DEG:
                 pulse = max(0.01, pulse / 2.0)  # Jumped past the target
             elif abs(remaining - after) < 0.4 * abs(remaining):
                 pulse = min(0.25, pulse * 1.6)  # Barely moved
 
-        print("Turn %+.1f deg: coasted %.1f deg, final error %+.2f deg"
-              % (angle, coast, turned() - angle))
+        print("Turn %+.1f deg (%+.1f offset): coasted %.1f deg, final error %+.2f deg"
+              % (angle, sign * offset, coast, turned() - goal))
     finally:
         stop()
+        with odo_lock:
+            update_odometer_locked()
+            theta = (theta - sign * offset) % 360.0
 
 
 def minimal_turn(target_heading):
@@ -686,14 +703,15 @@ def square_up_on_line():
     return wrap180(motion_state()[2] - theta_first)
 
 
-def back_up(distance):
-    """Drives straight backwards by 'distance' cm."""
+def move_straight(distance):
+    """Drives straight by 'distance' cm at creep power (negative = backwards)."""
+    direction = 1 if distance > 0 else -1
     start_travel = motion_state()[5]
     started = time.monotonic()
     try:
-        left_motor.set_power(-CREEP_POWER)
-        right_motor.set_power(-CREEP_POWER)
-        while (motion_state()[5] - start_travel < distance
+        left_motor.set_power(direction * CREEP_POWER)
+        right_motor.set_power(direction * CREEP_POWER)
+        while (motion_state()[5] - start_travel < abs(distance)
                and time.monotonic() - started < 5.0):
             time.sleep(LOOP_SECONDS)
     finally:
@@ -703,66 +721,78 @@ def back_up(distance):
 
 def calibrate_turn_routine():
     """
-    Routine to calibrate RIGHT_TURN_FACTOR and LEFT_TURN_FACTOR using a grid line
-    as the angle reference. For every turn:
-      square up on line -> back up -> turn CALIBRATE_ANGLE -> square up again.
+    Routine to calibrate RIGHT/LEFT_TURN_OFFSET_DEG and TRACK_WIDTH using a grid
+    line as the angle reference. For every turn:
+      square up on line -> back up -> turn -> square up again.
     The second square-up pivot is the physical turn error, so the real angle is
     known to a fraction of a degree without measuring anything by hand.
+    Fitting error = k * angle + b over CALIBRATE_ANGLES gives:
+      k -> TRACK_WIDTH (error proportional to the angle)
+      b -> turn offset (constant error, e.g. backlash when driving off)
     """
     print("\n--- TURN CALIBRATION ROUTINE ---")
     print("Robot must face a black line with its light sensors 2-5 cm before it.")
-    print("Testing angle: %.1f deg, %d repeats per direction" % (CALIBRATE_ANGLE, CALIBRATE_REPEATS))
+    print("Testing angles: %s deg, %d repeats each" % (list(CALIBRATE_ANGLES), CALIBRATE_REPEATS))
     time.sleep(2.0)
 
     directions = []
     if CALIBRATE_DIRECTION in ("right", "both"):
-        directions.append(("RIGHT", CALIBRATE_ANGLE, RIGHT_TURN_FACTOR))
+        directions.append(("RIGHT", 1, RIGHT_TURN_OFFSET_DEG))
     if CALIBRATE_DIRECTION in ("left", "both"):
-        directions.append(("LEFT", -CALIBRATE_ANGLE, LEFT_TURN_FACTOR))
+        directions.append(("LEFT", -1, LEFT_TURN_OFFSET_DEG))
 
     def square_exactly():
         # One square-up leaves ALIGN_LEVER_RATIO of the tilt; repeat until it is tiny
         square_up_on_line()
         for _ in range(4):
-            back_up(3.0)
+            move_straight(-3.0)
             if abs(square_up_on_line()) < 0.3:
                 break
 
     square_exactly()  # Start exactly square to the line
-    for name, angle, factor in directions:
-        sign = 1 if angle > 0 else -1
-        suggestions = []
-        for run in range(1, CALIBRATE_REPEATS + 1):
-            back_up(CALIBRATE_BACKUP_CM)
-            start_state = motion_state()
-            turn_by(angle)
-            end_state = motion_state()
-            odo_turned = abs(encoder_heading_change(end_state[3] - start_state[3],
-                                                    end_state[4] - start_state[4]))
+    slopes = []
+    for name, sign, offset in directions:
+        mean_error = {}
+        for angle in CALIBRATE_ANGLES:
+            errors = []
+            for run in range(1, CALIBRATE_REPEATS + 1):
+                move_straight(-CALIBRATE_BACKUP_CM)
+                # Drive forward a little first: the gear backlash before a turn
+                # must be the same as in navigation (always turns after driving)
+                move_straight(2.0)
+                turn_by(sign * angle)
 
-            # Positive = robot ended clockwise of the line normal
-            heading_off = -square_up_on_line() * (1.0 + ALIGN_LEVER_RATIO)
-            square_exactly()  # Next run starts square again
-            physical = abs(angle) + sign * heading_off
-            if abs(heading_off) > 30.0:
-                print("  %s run %d: %.1f deg off the line, ignored (bad square-up)"
-                      % (name, run, heading_off))
-                continue
-            suggestions.append(factor * odo_turned / physical)
-            print("  %s run %d: odometer %.2f deg, physical %.2f deg (%s by %.2f deg)"
-                  % (name, run, odo_turned, physical,
-                     "OVER-turned" if physical > odo_turned else "UNDER-turned",
-                     abs(physical - odo_turned)))
+                # Positive = robot ended clockwise of the line normal
+                heading_off = -square_up_on_line() * (1.0 + ALIGN_LEVER_RATIO)
+                square_exactly()  # Next run starts square again
+                if abs(heading_off) > 30.0:
+                    print("  %s %.0f run %d: %.1f deg off the line, ignored (bad square-up)"
+                          % (name, angle, run, heading_off))
+                    continue
+                error = sign * heading_off  # Positive = turned too far
+                errors.append(error)
+                print("  %s %.0f run %d: physical turn error %+.2f deg (%s)"
+                      % (name, angle, run, error, "too far" if error > 0 else "too short"))
+            if errors:
+                mean_error[angle] = sum(errors) / len(errors)
 
         print("--- %s TURN RESULTS ---" % name)
-        if suggestions:
-            print("  Set %s_TURN_FACTOR = %.4f   (currently %.4f)"
-                  % (name, sum(suggestions) / len(suggestions), factor))
-        else:
-            print("  No valid runs. Check the line thresholds and starting position.")
+        if len(mean_error) < 2:
+            print("  Not enough valid runs. Check the line thresholds and starting position.")
+            continue
+        (a1, e1), (a2, e2) = sorted(mean_error.items())[:2]
+        k = (e2 - e1) / (a2 - a1)  # Error per degree turned
+        b = e1 - k * a1  # Error every turn has regardless of size
+        slopes.append(k)
+        print("  Error = %+.2f deg + %+.3f%% of the angle" % (b, 100.0 * k))
+        print("  Set %s_TURN_OFFSET_DEG = %.2f   (currently %.2f)"
+              % (name, offset * (1.0 + k) - b, offset))
         print("  Learned coast: %.2f deg" % turn_coast[sign])
 
-    print("\nCalibration complete. Re-run until the factors stop changing.\n")
+    if slopes:
+        k = sum(slopes) / len(slopes)
+        print("\n  Set TRACK_WIDTH = %.3f   (currently %.3f)" % (TRACK_WIDTH / (1.0 + k), TRACK_WIDTH))
+    print("\nCalibration complete. Re-run until the values stop changing.\n")
 
 
 def calibrate_straight_routine():
