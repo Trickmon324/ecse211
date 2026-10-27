@@ -5,47 +5,27 @@ import time
 from threading import Thread, Lock, Event
 from utils.brick import Motor, EV3ColorSensor, wait_ready_sensors, reset_brick
 
-# =======================================================================
-# OPERATIONAL CONFIGURATION
-# =======================================================================
-# RUN_MODE options:
-#   "navigate"          -> Full Lab 4 navigation + cube delivery
-#   "test_delivery"     -> Test drop mechanism in place (tunes motor drop)
-#   "calibrate_turn"    -> Line-based turn calibration
-#   "calibrate_straight"-> Straight drive calibration
-#   "float"             -> Floats drive motors for TA manual check
 RUN_MODE = "navigate"
 
-NAVIGATION_MODE = "safest"        # "safest" or "shortest"
-WAYPOINTS = [(2, 2), (1, 1), (0, 0), (2, 1)]  # TA will provide at demo
+NAVIGATION_MODE = "safest"
+WAYPOINTS = [(2, 2), (1, 1), (0, 0), (2, 1)]
 
-AXIS_ORDER = "auto"               # "auto", ("x", "y"), or ("y", "x")
-POSITION_TOLERANCE_CM = 0.5       # Stop tolerance at waypoints
-MIN_LEG_CM = 3.0                  # Ignore axis legs shorter than this (odometry noise,
-                                  # not a real leg) -> no 90 deg turn for a 1 cm sidestep
+AXIS_ORDER = "auto"
+POSITION_TOLERANCE_CM = 0.5
+MIN_LEG_CM = 3.0
 SETTLE_AT_TARGET = True
 
-# =======================================================================
-# LAB 4: DELIVERY SYSTEM CONFIGURATION
-# =======================================================================
-DELIVERY_MOTOR_PORT = "B"         # Port for dispenser motor ("B" or "C")
-DELIVERY_MOTOR_POWER = -35         # Motor power for dispenser
-DELIVERY_MOTOR_DEGREES = 90.0     # Degrees of motor rotation to release 1 cube
-DELIVERY_SETTLE_SECONDS = 1.0     # Pause after drop to allow TA to remove cube
+DELIVERY_MOTOR_PORT = "B"
+DELIVERY_MOTOR_POWER = -35
+DELIVERY_MOTOR_DEGREES = 90.0
+DELIVERY_SETTLE_SECONDS = 1.0
 DELIVERY_TIMEOUT_SECONDS = 3.0
 
-# Physical dispenser offset from wheel axle center:
-#   DISPENSER_OFFSET_Y: Distance BEHIND axle (cm). Must be positive.
-#   DISPENSER_OFFSET_X: Distance to the RIGHT (+) or LEFT (-) of centerline (cm).
-DISPENSER_OFFSET_Y = 15         # Set to your measured dispenser distance behind axle
-DISPENSER_OFFSET_X = 0.0          # Set if dispenser is mounted off-center (0 = centered)
+DISPENSER_OFFSET_Y = 15
+DISPENSER_OFFSET_X = 0.0
 
-# Optional manual override for the X-alignment turn angle (in degrees):
-#   Set to None to automatically calculate from DISPENSER_OFFSET_X and DISPENSER_OFFSET_Y.
-#   Or set to an explicit float (e.g. 10.0 or -10.0) if you want to fine-tune by hand.
 DISPENSER_ALIGN_ANGLE_DEG = None
 
-# Calibration parameters
 CALIBRATE_DIRECTION = "both"
 CALIBRATE_ANGLE = 360.0
 CALIBRATE_REPEATS = 3
@@ -53,9 +33,6 @@ CALIBRATE_BACKUP_CM = 8.0
 CALIBRATE_SQUARE_POWER = 12
 CALIBRATE_DISTANCE_TILES = 3
 
-# =======================================================================
-# ROBOT CONSTANTS & TUNED VALUES (FROM LAB 3)
-# =======================================================================
 WHEEL_RADIUS = 2.1
 RIGHT_WHEEL_SCALE = 1.0
 TRACK_WIDTH = 13.5
@@ -63,15 +40,14 @@ TRACK_WIDTH = 13.5
 RIGHT_TURN_FACTOR = 1.0
 LEFT_TURN_FACTOR = 1.0
 
-SENSOR_OFFSET = 4.0               # Distance from axle to front light sensors (cm)
-SENSOR_SEPARATION = 6.3           # Distance between the two light sensors (cm)
-TILE = 30.48                      # Standard tile dimension in cm
+SENSOR_OFFSET = 4.0
+SENSOR_SEPARATION = 6.3
+TILE = 30.48
 
-START_X = 0.0                     # Origin x in cm
-START_Y = 0.0                     # Origin y in cm
-START_THETA = 0.0                 # Facing +y direction (0 degrees)
+START_X = 0.0
+START_Y = 0.0
+START_THETA = 0.0
 
-# Driving parameters
 DRIVE_POWER = 15
 START_POWER = 8
 ACCEL_STEP = 0.1
@@ -82,7 +58,6 @@ HEADING_KP = 1.4
 CROSS_TRACK_KP = 1.8
 MAX_CORRECTION = 8
 
-# Turning parameters
 TURN_POWER = 20
 TURN_MIN_POWER = 14
 TURN_RAMP_DEG = 10.0
@@ -95,15 +70,12 @@ TURN_MAX_NUDGES = 12
 TURN_SETTLE_SECONDS = 0.15
 TURN_180_DIRECTION = 1
 
-# Light sensor thresholds (White board vs Dark tape)
 WHITE_LEFT = 380
 WHITE_RIGHT = 370
 LINE_DROP = 200
 
-# Buffer distance: Trust encoders; ignore line drops until this distance elapses
 DISTANCE_NO_LOOKING_FOR_LINE = 15.0
 
-# Alignment constraints
 PERP_LINE_TOLERANCE_CM = 4.0
 ALIGN_POWER = 15
 MAX_ALIGN_PIVOT_DEG = 12.0
@@ -115,14 +87,8 @@ ALIGN_TIMEOUT_SECONDS = 3.0
 MOTION_TIMEOUT_SECONDS = 60.0
 LOOP_SECONDS = 0.01
 
-# Corner correction: always square up on the grid line at the end of each leg
-# (as the sensors cross it on arrival), so every turn starts from a corrected
-# heading and position. No backing up.
 SQUARE_ON_CORNER_LINE = True
 
-# =======================================================================
-# HARDWARE INITIALIZATION
-# =======================================================================
 left_motor = Motor("A")
 right_motor = Motor("D")
 delivery_motor = Motor(DELIVERY_MOTOR_PORT)
@@ -130,7 +96,6 @@ left_light = EV3ColorSensor(1)
 right_light = EV3ColorSensor(2)
 wait_ready_sensors(True)
 
-# State variables
 x, y, theta = START_X, START_Y, START_THETA
 last_left = last_right = 0.0
 left_distance = right_distance = travel = 0.0
@@ -140,7 +105,6 @@ last_light = {"L": None, "R": None}
 
 
 def init_odometer():
-    """Initializes encoder baselines and robot pose."""
     global x, y, theta, last_left, last_right
     global left_distance, right_distance, travel
     with odo_lock:
@@ -156,14 +120,12 @@ def init_odometer():
 
 
 def encoder_heading_change(left_cm, right_cm):
-    """Calculates heading change from wheel travel using direction-specific factors."""
     raw_angle = math.degrees((left_cm - right_cm) / TRACK_WIDTH)
     factor = RIGHT_TURN_FACTOR if raw_angle >= 0 else LEFT_TURN_FACTOR
     return raw_angle / factor
 
 
 def update_odometer_locked():
-    """Updates position (x, y) and heading (theta) with odo_lock held."""
     global x, y, theta, last_left, last_right
     global left_distance, right_distance, travel
 
@@ -182,26 +144,22 @@ def update_odometer_locked():
     turn = encoder_heading_change(dl, dr)
     mid = math.radians(theta + turn / 2.0)
 
-    # 0 deg = +y (North), 90 deg = +x (East)
     x += center * math.sin(mid)
     y += center * math.cos(mid)
     theta = (theta + turn) % 360.0
 
 
 def update_odometer():
-    """Thread-safe call to update odometry."""
     with odo_lock:
         update_odometer_locked()
 
 
 def motion_state():
-    """Returns (x, y, theta, left_dist, right_dist, total_travel)."""
     with odo_lock:
         return x, y, theta, left_distance, right_distance, travel
 
 
 def float_motors():
-    """Required as-is by ECSE 211 lab specification."""
     left_motor.float_motor()
     right_motor.float_motor()
     while True:
@@ -210,14 +168,12 @@ def float_motors():
 
 
 def odometer_loop():
-    """Continuous background odometry thread."""
     while not shutdown.is_set():
         update_odometer()
         time.sleep(LOOP_SECONDS)
 
 
 def display_loop():
-    """Outputs current coordinates and heading to console."""
     while not shutdown.is_set():
         px, py, heading = motion_state()[:3]
         print("x: %6.2f cm | y: %6.2f cm | theta: %5.1f deg"
@@ -225,11 +181,7 @@ def display_loop():
         time.sleep(0.25)
 
 
-# =======================================================================
-# LIGHT SENSORS
-# =======================================================================
 def read_light(sensor):
-    """Reads color sensor total RGB intensity."""
     rgb = sensor.get_value()
     total = sum(rgb[:3]) if rgb is not None and len(rgb) >= 3 else None
     last_light["L" if sensor is left_light else "R"] = total
@@ -237,14 +189,12 @@ def read_light(sensor):
 
 
 def on_line(sensor):
-    """Detects black line based on calibrated threshold."""
     total = read_light(sensor)
     white = WHITE_LEFT if sensor is left_light else WHITE_RIGHT
     return None if total is None else total < (white - LINE_DROP)
 
 
 class LineGate:
-    """Manages cooldown and state transitions for perpendicular line detections."""
     def __init__(self):
         self.reset()
 
@@ -261,33 +211,25 @@ class LineGate:
 line_gate = LineGate()
 
 
-# =======================================================================
-# GEOMETRY HELPERS
-# =======================================================================
 def wrap180(angle):
-    """Wraps an angle to [-180, 180)."""
     return ((angle + 180.0) % 360.0) - 180.0
 
 
 def heading_vector(heading):
-    """Unit vector (x, y) of a compass heading (0 = +y, 90 = +x)."""
     rad = math.radians(heading)
     return math.sin(rad), math.cos(rad)
 
 
 def heading_error(target):
-    """Calculates minimal signed heading difference in [-180, 180]."""
     return wrap180(target - motion_state()[2])
 
 
 def bearing_to(target_x, target_y, state=None):
-    """Compass heading from the robot to a target point."""
     state = state or motion_state()
     return math.degrees(math.atan2(target_x - state[0], target_y - state[1])) % 360.0
 
 
 def leg_errors(target_x, target_y, heading, state=None):
-    """Position of the target relative to a leg line ending at (target_x, target_y)."""
     state = state or motion_state()
     hx, hy = heading_vector(heading)
     ex, ey = target_x - state[0], target_y - state[1]
@@ -296,16 +238,12 @@ def leg_errors(target_x, target_y, heading, state=None):
     return along, lateral
 
 
-# =======================================================================
-# MOTION PRIMITIVES
-# =======================================================================
 def stop():
     left_motor.set_power(0)
     right_motor.set_power(0)
 
 
 def drive_powers(target_heading, base_power, bias=0):
-    """Calculates P-controlled motor powers, with soft-start base power and steering bias."""
     err = heading_error(target_heading)
     corr = max(-MAX_CORRECTION, min(MAX_CORRECTION, HEADING_KP * err + bias))
     p_left = int(round(max(0, min(100, base_power + corr))))
@@ -316,7 +254,6 @@ def drive_powers(target_heading, base_power, bias=0):
 
 
 def snap_to_line(target_heading, line_coord, pivot_deg, leg_distance):
-    """Corrects odometer coordinate and heading when crossing a verified perpendicular line."""
     global x, y, theta
     h = int(round(target_heading)) % 360
     hx, hy = (round(v) for v in heading_vector(h))
@@ -340,7 +277,6 @@ def snap_to_line(target_heading, line_coord, pivot_deg, leg_distance):
 
 
 def drive_to(target_x, target_y, heading, light_correction=True):
-    """Drives forward to (target_x, target_y) with light correction and power ramps."""
     heading %= 360.0
     h_int = int(round(heading)) % 360
     if light_correction and (h_int not in (0, 90, 180, 270) or abs(heading - h_int) > 0.5):
@@ -358,10 +294,6 @@ def drive_to(target_x, target_y, heading, light_correction=True):
     current_base_power = float(START_POWER)
     align = None
 
-    # Corner line: the grid line through the leg's end point. The sensors cross it
-    # ~SENSOR_OFFSET before the axle arrives, so we always square up on it (ignoring
-    # the no-look buffer and cooldown) -> the robot reaches the corner already
-    # corrected and can turn without backing up.
     target_fwd = target_y if is_y_axis else target_x
     end_line = round(target_fwd / TILE) * TILE
     end_line_pending = (light_correction and SQUARE_ON_CORNER_LINE
@@ -428,7 +360,7 @@ def drive_to(target_x, target_y, heading, light_correction=True):
                     segment_start_fwd = forward_coord(state)
                     line_gate.crossed(time.monotonic())
                     if abs(align["line"] - end_line) < 0.5:
-                        end_line_pending = False   # Corner line done, don't re-trigger on it
+                        end_line_pending = False
                     align = None
                     current_base_power = float(START_POWER)
 
@@ -558,11 +490,7 @@ def turn_to_heading(target_heading):
     turn_by(minimal_turn(target_heading))
 
 
-# =======================================================================
-# LAB 4: DELIVERY MECHANISM & DROP ROUTINES
-# =======================================================================
 def drop_one_cube():
-    """Spins the delivery motor to release exactly one foam cube."""
     print("--> Dispensing foam cube...")
     start_pos = delivery_motor.get_encoder()
     sign = 1 if DELIVERY_MOTOR_DEGREES >= 0 else -1
@@ -582,19 +510,14 @@ def drop_one_cube():
 
 
 def get_align_angle():
-    """Returns the angle to turn based on DISPENSER_OFFSET_X."""
     if DISPENSER_ALIGN_ANGLE_DEG is not None:
         return float(DISPENSER_ALIGN_ANGLE_DEG)
     if abs(DISPENSER_OFFSET_X) < 0.1:
         return 0.0
-    # Negative X (dispenser on left) turns clockwise (+); Positive X turns counter-clockwise (-)
     return math.degrees(math.atan2(-DISPENSER_OFFSET_X, DISPENSER_OFFSET_Y))
 
 
 def drop_cube_with_x_alignment():
-    """
-    Turns by the offset X angle, drops the cube, then turns back to get back on track.
-    """
     align_angle = get_align_angle()
     if abs(align_angle) > 1.0:
         print("--> Turning %+.1f deg to align dispenser X-offset..." % align_angle)
@@ -608,7 +531,6 @@ def drop_cube_with_x_alignment():
 
 
 def creep_distance(dist_cm):
-    """Straight creep move forward by dist_cm using encoders."""
     if dist_cm <= 0.2:
         return
     start_travel = motion_state()[5]
@@ -625,15 +547,10 @@ def creep_distance(dist_cm):
     time.sleep(0.15)
 
 
-# =======================================================================
-# NAVIGATION
-# =======================================================================
 def plan_axis_order(target_x, target_y):
-    """Picks axis order that minimizes total degrees turned, ensuring active leg is first."""
     state = motion_state()
     dx, dy = target_x - state[0], target_y - state[1]
 
-    # If one axis is already reached, put the other axis first
     if abs(dx) <= MIN_LEG_CM:
         return ("y", "x")
     if abs(dy) <= MIN_LEG_CM:
@@ -656,7 +573,6 @@ def plan_axis_order(target_x, target_y):
 
 
 def travel_to_safest(prev_x, prev_y, target_x, target_y):
-    """Travels along grid lines with light correction."""
     order = plan_axis_order(target_x, target_y)
     for axis in order:
         state = motion_state()
@@ -677,7 +593,6 @@ def travel_to_safest(prev_x, prev_y, target_x, target_y):
 
 
 def travel_to_shortest(prev_x, prev_y, target_x, target_y):
-    """Turns towards the target with minimal angle, then drives straight."""
     state = motion_state()
     if math.hypot(target_x - state[0], target_y - state[1]) <= POSITION_TOLERANCE_CM:
         return
@@ -689,12 +604,7 @@ def travel_to_shortest(prev_x, prev_y, target_x, target_y):
 
 
 def deliver_on_departure_to_next(next_target_x, next_target_y):
-    """
-    Prepares for the next waypoint, drives forward Y cm, drops the cube with
-    the X-offset turn, realigns, and is ready to continue forward.
-    """
     state = motion_state()
-    # 1. Determine departure heading
     if NAVIGATION_MODE == "safest":
         order = plan_axis_order(next_target_x, next_target_y)
         first_axis = order[0]
@@ -707,22 +617,18 @@ def deliver_on_departure_to_next(next_target_x, next_target_y):
     else:
         dep_heading = bearing_to(next_target_x, next_target_y, state)
 
-    # 2. Turn to face next direction ("prepare to go to other point")
     print("--> Preparing departure: turning to heading %.1f deg" % dep_heading)
     turn_to_heading(dep_heading)
 
-    # 3. Drive forward Y cm towards the next point
     if DISPENSER_OFFSET_Y > 0:
         print("--> Driving forward %.1f cm (dispenser is now directly on waypoint)..." % DISPENSER_OFFSET_Y)
         creep_distance(DISPENSER_OFFSET_Y)
 
-    # 4. Move angle (offset X), drop cube, move back angle
     drop_cube_with_x_alignment()
     print("--> Realigned on track. Continuing to next waypoint without reversing!")
 
 
 def deliver_at_final_waypoint():
-    """Delivery at Waypoint 4: steps forward Y cm, drops cube, realigns."""
     if DISPENSER_OFFSET_Y > 0:
         print("--> Advancing %.1f cm to place rear dispenser on final waypoint..." % DISPENSER_OFFSET_Y)
         creep_distance(DISPENSER_OFFSET_Y)
@@ -732,12 +638,6 @@ def deliver_at_final_waypoint():
 
 
 def navigate_waypoints():
-    """
-    Lab 4 Execution:
-      - Visits each waypoint.
-      - Stops so TA verifies arrival (< 2 cm).
-      - Drops cube on departure forward (no reversing) towards next point.
-    """
     travel_to = travel_to_safest if NAVIGATION_MODE == "safest" else travel_to_shortest
     prev_x, prev_y = START_X, START_Y
 
@@ -748,25 +648,19 @@ def navigate_waypoints():
     for idx, (tx, ty) in enumerate(WAYPOINTS, 1):
         target_x = tx * TILE
         target_y = ty * TILE
-        # 1. Drive to waypoint
         travel_to(prev_x, prev_y, target_x, target_y)
         px, py = motion_state()[:2]
         err = math.hypot(target_x - px, target_y - py)
         print(">>> ARRIVED at Waypoint %d: (%.2f, %.2f) cm | Error: %.2f cm"
               % (idx, px, py, err))
 
-        # Pause so TA records arrival
         time.sleep(1.0)
 
-        # 2. Cube delivery
         if idx < len(WAYPOINTS):
-            # Not the final waypoint: prepare for next point, drive Y cm forward,
-            # drop cube with X-alignment, and then loop continues to next waypoint!
             next_tx, next_ty = WAYPOINTS[idx]
             next_x, next_y = next_tx * TILE, next_ty * TILE
             deliver_on_departure_to_next(next_x, next_y)
         else:
-            # Final Waypoint (Waypoint 4): no next point, step Y forward and drop
             print("\n>>> Delivering final cube for Waypoint 4...")
             deliver_at_final_waypoint()
 
@@ -779,9 +673,6 @@ def navigate_waypoints():
     print("==============================================\n")
 
 
-# =======================================================================
-# CALIBRATION ROUTINES
-# =======================================================================
 def square_up_on_line():
     hits = {"L": False, "R": False}
     theta_first = None
@@ -849,9 +740,6 @@ def calibrate_straight_routine():
     print("Odometer forward: %.2f cm (sideways: %+.2f cm)" % (py - START_Y, px - START_X))
 
 
-# =======================================================================
-# MAIN ENTRY POINT
-# =======================================================================
 if __name__ == "__main__":
     workers = []
     try:
