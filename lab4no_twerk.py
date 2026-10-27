@@ -113,14 +113,10 @@ ALIGN_TIMEOUT_SECONDS = 3.0
 MOTION_TIMEOUT_SECONDS = 60.0
 LOOP_SECONDS = 0.01
 
-# Pre-turn line correction: before turning at a grid intersection, back up,
-# square both light sensors on the perpendicular line, snap heading + position,
-# then return to the intersection and turn from a known-good pose.
-CORRECT_BEFORE_TURNS = True
-PRE_TURN_MIN_ANGLE_DEG = 20.0     # Only correct before real turns (skip ~0 deg "turns")
-INTERSECTION_TOLERANCE_CM = 4.0   # Robot must be this close to a grid intersection
-PRE_TURN_BACKUP_MARGIN_CM = 4.0   # How far behind the line the sensors go before squaring
-PRE_TURN_SQUARE_POWER = 12
+# Corner correction: always square up on the grid line at the end of each leg
+# (as the sensors cross it on arrival), so every turn starts from a corrected
+# heading and position. No backing up.
+SQUARE_ON_CORNER_LINE = True
 
 # =======================================================================
 # HARDWARE INITIALIZATION
@@ -360,6 +356,15 @@ def drive_to(target_x, target_y, heading, light_correction=True):
     current_base_power = float(START_POWER)
     align = None
 
+    # Corner line: the grid line through the leg's end point. The sensors cross it
+    # ~SENSOR_OFFSET before the axle arrives, so we always square up on it (ignoring
+    # the no-look buffer and cooldown) -> the robot reaches the corner already
+    # corrected and can turn without backing up.
+    target_fwd = target_y if is_y_axis else target_x
+    end_line = round(target_fwd / TILE) * TILE
+    end_line_pending = (light_correction and SQUARE_ON_CORNER_LINE
+                        and abs(target_fwd - end_line) < 0.5)
+
     try:
         while True:
             state = motion_state()
@@ -373,8 +378,13 @@ def drive_to(target_x, target_y, heading, light_correction=True):
                 break
 
             l_on = r_on = False
-            can_look = (light_correction and line_gate.ready(now)
-                        and state[5] - travel_at_last_line >= DISTANCE_NO_LOOKING_FOR_LINE)
+            sensor_fwd = forward_coord(state) + fwd_sign * SENSOR_OFFSET
+            near_end_line = (end_line_pending
+                             and abs(sensor_fwd - end_line) <= PERP_LINE_TOLERANCE_CM)
+            can_look = light_correction and (
+                near_end_line
+                or (line_gate.ready(now)
+                    and state[5] - travel_at_last_line >= DISTANCE_NO_LOOKING_FOR_LINE))
             if align is not None or can_look:
                 l_on = bool(on_line(left_light))
                 r_on = bool(on_line(right_light))
@@ -415,6 +425,8 @@ def drive_to(target_x, target_y, heading, light_correction=True):
                     travel_at_last_line = state[5]
                     segment_start_fwd = forward_coord(state)
                     line_gate.crossed(time.monotonic())
+                    if abs(align["line"] - end_line) < 0.5:
+                        end_line_pending = False   # Corner line done, don't re-trigger on it
                     align = None
                     current_base_power = float(START_POWER)
 
@@ -422,6 +434,8 @@ def drive_to(target_x, target_y, heading, light_correction=True):
                       or abs(pivot) > MAX_ALIGN_PIVOT_DEG):
                     print("--> Alignment aborted (false line or slant). Resuming encoders.")
                     line_gate.crossed(now)
+                    if abs(align["line"] - end_line) < 0.5:
+                        end_line_pending = False
                     align = None
 
             time.sleep(LOOP_SECONDS)
@@ -538,94 +552,7 @@ def back_up(distance):
     time.sleep(0.2)
 
 
-def square_to_line(heading, max_cm):
-    """
-    Creeps forward until BOTH light sensors sit on the perpendicular line ahead,
-    stopping each wheel as its sensor reaches the line.
-    Returns (pivot_deg, line_coord_cm), or None if no valid line was found.
-    """
-    h = int(round(heading)) % 360
-    is_y_axis = h in (0, 180)
-    fwd_sign = 1 if h in (0, 90) else -1
-    hits = {"L": False, "R": False}
-    theta_first = None
-    line_coord = None
-    start_travel = motion_state()[5]
-    started = time.monotonic()
-    try:
-        while not (hits["L"] and hits["R"]):
-            state = motion_state()
-            if state[5] - start_travel > max_cm or time.monotonic() - started > 8.0:
-                return None
-            l_on = bool(on_line(left_light))
-            r_on = bool(on_line(right_light))
-            if theta_first is None and (l_on or r_on):
-                theta_first = state[2]
-                fwd = state[1] if is_y_axis else state[0]
-                sensor_coord = fwd + fwd_sign * SENSOR_OFFSET
-                line_coord = round(sensor_coord / TILE) * TILE
-                if abs(sensor_coord - line_coord) > PERP_LINE_TOLERANCE_CM:
-                    return None   # Not where a grid line should be -> don't trust it
-            hits["L"] = hits["L"] or l_on
-            hits["R"] = hits["R"] or r_on
-            left_motor.set_power(0 if hits["L"] else PRE_TURN_SQUARE_POWER)
-            right_motor.set_power(0 if hits["R"] else PRE_TURN_SQUARE_POWER)
-            time.sleep(LOOP_SECONDS)
-    finally:
-        stop()
-    time.sleep(0.1)
-    pivot = wrap180(motion_state()[2] - theta_first)
-    if abs(pivot) > MAX_ALIGN_PIVOT_DEG:
-        return None
-    return pivot, line_coord
-
-
-def correct_before_turn(new_heading):
-    """
-    If the robot is sitting on a grid intersection with a grid heading and is
-    about to make a real turn, square up on the perpendicular line first so the
-    turn starts from a corrected heading and position.
-    """
-    if not CORRECT_BEFORE_TURNS:
-        return
-    state = motion_state()
-    if state[5] < 1.0:
-        return  # Hasn't moved yet: hand-placed at the start, nothing to correct
-
-    heading = state[2]
-    h = int(round(heading / 90.0)) * 90 % 360
-    if abs(wrap180(heading - h)) > MAX_ALIGN_PIVOT_DEG:
-        return  # Not on a grid heading (e.g. diagonal leg in "shortest" mode)
-    if abs(wrap180(new_heading - heading)) < PRE_TURN_MIN_ANGLE_DEG:
-        return  # Basically going straight, no turn to protect
-
-    gx = round(state[0] / TILE) * TILE
-    gy = round(state[1] / TILE) * TILE
-    if math.hypot(state[0] - gx, state[1] - gy) > INTERSECTION_TOLERANCE_CM:
-        return  # Not on an intersection, no perpendicular line under the sensors
-
-    print("--> Pre-turn correction at (%.1f, %.1f) cm, heading %d deg" % (gx, gy, h))
-    # Sensors are SENSOR_OFFSET past the line, so back up just behind it, then
-    # square up once and correct from that first contact.
-    back = PRE_TURN_BACKUP_MARGIN_CM + SENSOR_OFFSET
-    back_up(back)
-    result = square_to_line(h, back + PERP_LINE_TOLERANCE_CM + 2.0)
-    if result is None:
-        print("--> Pre-turn correction: line not found, keeping encoder pose")
-    else:
-        pivot, line_coord = result
-        snap_to_line(h, line_coord, pivot, 0.0)
-        s = motion_state()
-        print("--> Squared on line %.1f cm (pivot %+.1f deg) -> pose (%.2f, %.2f, %.1f)"
-              % (line_coord, pivot, s[0], s[1], s[2]))
-
-    # Axle is now ~SENSOR_OFFSET behind the intersection: move back onto it
-    settle_on_target(gx, gy, h)
-
-
-def turn_to_heading(target_heading, correct_first=True):
-    if correct_first:
-        correct_before_turn(target_heading)
+def turn_to_heading(target_heading):
     turn_by(minimal_turn(target_heading))
 
 
