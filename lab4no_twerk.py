@@ -21,6 +21,8 @@ WAYPOINTS = [(2, 2), (1, 1), (0, 0), (2, 1)]  # TA will provide at demo
 
 AXIS_ORDER = "auto"               # "auto", ("x", "y"), or ("y", "x")
 POSITION_TOLERANCE_CM = 0.5       # Stop tolerance at waypoints
+MIN_LEG_CM = 3.0                  # Ignore axis legs shorter than this (odometry noise,
+                                  # not a real leg) -> no 90 deg turn for a 1 cm sidestep
 SETTLE_AT_TARGET = True
 
 # =======================================================================
@@ -632,9 +634,9 @@ def plan_axis_order(target_x, target_y):
     dx, dy = target_x - state[0], target_y - state[1]
 
     # If one axis is already reached, put the other axis first
-    if abs(dx) <= POSITION_TOLERANCE_CM:
+    if abs(dx) <= MIN_LEG_CM:
         return ("y", "x")
-    if abs(dy) <= POSITION_TOLERANCE_CM:
+    if abs(dy) <= MIN_LEG_CM:
         return ("x", "y")
     if AXIS_ORDER != "auto":
         return AXIS_ORDER
@@ -645,7 +647,7 @@ def plan_axis_order(target_x, target_y):
         h, total = state[2], 0.0
         for axis in order:
             rem, leg_heading = legs[axis]
-            if abs(rem) > POSITION_TOLERANCE_CM:
+            if abs(rem) > MIN_LEG_CM:
                 total += abs(wrap180(leg_heading - h))
                 h = leg_heading
         return total
@@ -667,7 +669,7 @@ def travel_to_safest(prev_x, prev_y, target_x, target_y):
             heading = 0.0 if rem > 0 else 180.0
             leg_end = (prev_x if axis == order[0] else target_x, target_y)
 
-        if abs(rem) <= POSITION_TOLERANCE_CM:
+        if abs(rem) <= MIN_LEG_CM:
             continue
 
         turn_to_heading(heading)
