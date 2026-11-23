@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""
+ECSE 211 - Lab 4 / Final Project: Unified Mapping & Calibration Engine
+Features:
+  - Dynamic Side Ultrasonic mounting ("right" or "left") with 5-sample median filter
+  - Ultrasonic update freezing during in-place turns
+  - Dual light sensor 11-sample median filter with perpendicular line squaring & odometry snap
+  - Front touch sensor bumper with pre-backup side query for smart corner turns
+  - Configurable post-line advance distance before turning
+  - 4 Dedicated RUN_MODES: "map", "calibrate_turn", "calibrate_straight", "calibrate_light_squaring"
+"""
+
+import math
+import time
+from collections import deque
+import statistics
+from threading import Thread, Lock, Event
+
+# Hardware imports from project utils
+from utils.brick import (
+    Motor, EV3ColorSensor, TouchSensor, EV3UltrasonicSensor,
+    wait_ready_sensors, reset_brick
+)
+
+# =======================================================================
+# 1. OPERATIONAL MODE & SENSOR PLACEMENT
+# =======================================================================
+# RUN_MODE Options:
+#   "map"                      -> Full autonomous mapping routine
+#   "calibrate_turn"           -> Calibrates TRACK_WIDTH and turn factors (>360 deg support)
+#   "calibrate_straight"       -> Tests power balance between left and right wheels
+#   "calibrate_light_squaring" -> Drives forward, tests line squaring, drift math & snapping
+RUN_MODE = "map"
+
+# SIDE SENSOR MOUNT DIRECTION: Set to "right" or "left"
+SIDE_SENSOR_ORIENTATION = "right"  # Options: "right" or "left"
+
+# =======================================================================
+# 2. PHYSICAL DIMENSIONS & ROBOT CONSTANTS
+# =======================================================================
+ROBOT_LENGTH_CM = 22.0          # Front bumper to rear frame
+ROBOT_WIDTH_CM = 17.5           # Outer wheel edge to outer wheel edge
+TRACK_WIDTH = 13.5              # Center of left tire to center of right tire (cm)
+WHEEL_RADIUS = 2.1              # Wheel radius in cm
+RIGHT_WHEEL_SCALE = 1.0         # Scale factor for right motor encoder ticks
+
+TOUCH_SENSOR_OFFSET_CM = 11.0   # Front bumper distance from wheel axle (cm)
+SENSOR_OFFSET = 4.0             # Distance from axle forward to light sensors (cm)
+SENSOR_SEPARATION = 6.3         # Distance between left and right light sensors (cm)
+TILE = 30.48                    # Standard grid tile dimension (cm)
+
+# Post-line intersection center distance:
+# Advance this distance after the light sensors cross a line before turning
+POST_LINE_FORWARD_CM = 6.0      
+
+# Backup clearance after touching a front wall
+BUMP_BACKUP_CM = 6.0            
+
+# =======================================================================
+# 3. ULTRASONIC SIDE DISTANCE CONFIGURATION
+# =======================================================================
+# Calibration values:
+#   5.0 cm  = centered in corridor
+#   10.0 cm = close to opposite wall / open space
+#   2.0 cm  = too close to the sensor-side wall
+US_BAND_CENTER = 5.0
+US_TOO_CLOSE = 2.0
+US_TOO_FAR = 10.0
+WALL_DETECT_THRESHOLD_CM = 7.5  # Below this: wall present; Above this: open corridor
+
+SIDE_WALL_KP = 1.4              # Proportional gain for side-wall tracking
+MAX_WALL_BIAS = 6               # Clamped steering bias from distance sensor
+US_FILTER_SAMPLES = 5           # Rolling median window size for ultrasonic
+
+# =======================================================================
+# 4. LIGHT SENSORS & LINE SQUARING CONFIGURATION
+# =======================================================================
+WHITE_LEFT = 380                # Calibrated background surface RGB sum
+WHITE_RIGHT = 370
+LINE_DROP = 200                 # Drop below baseline to trigger dark line
+LIGHT_FILTER_SAMPLES = 11       # 11-sample rolling median filter
+
+DISTANCE_NO_LOOKING_FOR_LINE = 12.0  # Blind encoder distance after line detection (cm)
+PERP_LINE_TOLERANCE_CM = 4.5         # Expected grid line tolerance window (cm)
+LINE_COOLDOWN_SECONDS = 0.8
+ALIGN_LEVER_RATIO = ((TRACK_WIDTH - SENSOR_SEPARATION) / 2.0) / SENSOR_SEPARATION
+APPLY_LATERAL_DRIFT = True
+MAX_LATERAL_DRIFT_CM = 3.5
+
+# =======================================================================
+# 5. MOTOR POWERS & TURNING CONSTANTS
+# =======================================================================
+DRIVE_POWER = 15
+ALIGN_POWER = 12
+CREEP_POWER = 10
+
+RIGHT_TURN_FACTOR = 1.0
+LEFT_TURN_FACTOR = 1.0
+TURN_POWER = 20
+TURN_MIN_POWER = 14
+TURN_RAMP_DEG = 10.0
+TURN_SLOW_DEG = 40.0
+TURN_TOLERANCE_DEG = 0.5
+
+# Calibration Routine Parameters
+CALIB_TURN_ANGLE = 720.0        # Angle to test (can be > 360 deg)
+CALIB_TURN_POWER = 20           # Motor power for turn calibration
+CALIB_STRAIGHT_TILES = 3        # Tiles to drive in straight calibration
+
+LOOP_SECONDS = 0.01
+
+# =======================================================================
+# 6. HARDWARE INITIALIZATION
+# =======================================================================
+left_motor = Motor("A")
+right_motor = Motor("D")
+
+left_light = EV3ColorSensor(1)
+touch_sensor = TouchSensor(2)
+side_us = EV3UltrasonicSensor(3)
+right_light = EV3ColorSensor(4)
+
+print("Waiting for sensors on S1, S2, S3, S4...")
+wait_ready_sensors(True)
+print("Sensors ready!")
+
+# System State Variables
+x, y, theta = 0.0, 0.0, 0.0
+last_left = last_right = 0.0
+left_distance = right_distance = travel = 0.0
+odo_lock = Lock()
+shutdown = Event()
+
+# Turning status: Freeze ultrasonic filtering during rotations
+is_turning = False
+
+# Rolling median buffers
+us_buffer = deque(maxlen=US_FILTER_SAMPLES)
+left_light_buf = deque(maxlen=LIGHT_FILTER_SAMPLES)
+right_light_buf = deque(maxlen=LIGHT_FILTER_SAMPLES)
+
+# Map storage: records grid coordinates of detected wall edges
+discovered_walls = set()
+
+
+# =======================================================================
+# 7. ODOMETRY & THREADED TRACKING
+# =======================================================================
+def init_odometer():
+    """Zeros encoders and coordinates."""
+    global x, y, theta, last_left, last_right
+    global left_distance, right_distance, travel
+    with odo_lock:
+        left_motor.reset_encoder()
+        right_motor.reset_encoder()
+        last_left = left_motor.get_encoder()
+        last_right = right_motor.get_encoder()
+        x, y, theta = 0.0, 0.0, 0.0
+        left_distance = right_distance = travel = 0.0
+    shutdown.clear()
+
+
+def encoder_heading_change(left_cm, right_cm):
+    """Calculates heading change scaled by turn calibration factors."""
+    raw_angle = math.degrees((left_cm - right_cm) / TRACK_WIDTH)
+    factor = RIGHT_TURN_FACTOR if raw_angle >= 0 else LEFT_TURN_FACTOR
+    return raw_angle / factor
+
+
+def update_odometer_locked():
+    """Odometry update step (must be called with odo_lock held)."""
+    global x, y, theta, last_left, last_right
+    global left_distance, right_distance, travel
+
+    cur_left = left_motor.get_encoder()
+    cur_right = right_motor.get_encoder()
+
+    dl = math.radians(cur_left - last_left) * WHEEL_RADIUS
+    dr = math.radians(cur_right - last_right) * WHEEL_RADIUS * RIGHT_WHEEL_SCALE
+    last_left, last_right = cur_left, cur_right
+
+    left_distance += dl
+    right_distance += dr
+    travel += (abs(dl) + abs(dr)) / 2.0
+
+    center = (dl + dr) / 2.0
+    turn = encoder_heading_change(dl, dr)
+    mid = math.radians(theta + turn / 2.0)
+
+    # 0 deg = +Y (North), 90 deg = +X (East)
+    x += center * math.sin(mid)
+    y += center * math.cos(mid)
+    theta = (theta + turn) % 360.0
+
+
+def update_odometer():
+    with odo_lock:
+        update_odometer_locked()
+
+
+def motion_state():
+    """Returns thread-safe snapshot: (x, y, theta, left_dist, right_dist, travel)."""
+    with odo_lock:
+        return x, y, theta, left_distance, right_distance, travel
+
+
+def odometer_thread_loop():
+    while not shutdown.is_set():
+        update_odometer()
+        time.sleep(LOOP_SECONDS)
+
+
+# =======================================================================
+# 8. SENSOR FILTERING & READING
+# =======================================================================
+def get_filtered_distance():
+    """
+    Returns median filtered side ultrasonic reading in cm.
+    Frozen during in-place turns to avoid logging false wall measurements.
+    """
+    global is_turning
+    if is_turning:
+        return us_buffer[-1] if len(us_buffer) > 0 else US_BAND_CENTER
+
+    val = side_us.get_cm()
+    if val is not None and 0.0 <= val < 255.0:
+        us_buffer.append(float(val))
+    elif val is not None and val >= 255.0:
+        us_buffer.append(255.0)
+
+    return statistics.median(us_buffer) if len(us_buffer) > 0 else US_BAND_CENTER
+
+
+def get_filtered_light(sensor):
+    """
+    Applies Option A (11-sample median filter) to color sensor RGB sum.
+    """
+    rgb = sensor.get_rgb()
+    buf = left_light_buf if sensor is left_light else right_light_buf
+
+    if rgb is not None and len(rgb) == 3:
+        total = sum(rgb)
+        buf.append(total)
+
+    return statistics.median(buf) if len(buf) > 0 else None
+
+
+def on_line(sensor):
+    """Checks if filtered light sensor reading drops into black line range."""
+    filtered_val = get_filtered_light(sensor)
+    if filtered_val is None:
+        return False
+    threshold = (WHITE_LEFT if sensor is left_light else WHITE_RIGHT) - LINE_DROP
+    return filtered_val < threshold
+
+
+def is_touch_bumped():
+    """Checks if front bumper switch is pressed (1 = pressed, 0 = released)."""
+    val = touch_sensor.get_value()
+    return val == 1
+
+
+def wrap180(angle):
+    """Wraps angle to [-180, 180)."""
+    return ((angle + 180.0) % 360.0) - 180.0
+
+
+# =======================================================================
+# 9. MOTION PRIMITIVES & POWER CONTROL
+# =======================================================================
+def stop():
+    left_motor.set_power(0)
+    right_motor.set_power(0)
+
+
+def turn_by(angle, power=TURN_POWER):
+    """
+    Turns in place by 'angle' degrees.
+    Freezes ultrasonic buffer updates during rotation.
+    """
+    global is_turning
+    is_turning = True
+    sign = 1 if angle > 0 else -1
+    target_turn = abs(angle)
+
+    update_odometer()
+    start_state = motion_state()
+
+    def turned():
+        s = motion_state()
+        return abs(encoder_heading_change(s[3] - start_state[3], s[4] - start_state[4]))
+
+    try:
+        while turned() < target_turn - TURN_TOLERANCE_DEG:
+            rem = target_turn - turned()
+            ramp = min(1.0, max(0.1, turned() / TURN_RAMP_DEG))
+            slow = min(1.0, max(0.2, rem / TURN_SLOW_DEG))
+            p = int(round(TURN_MIN_POWER + (power - TURN_MIN_POWER) * min(ramp, slow)))
+            left_motor.set_power(sign * p)
+            right_motor.set_power(-sign * p)
+            time.sleep(0.005)
+    finally:
+        stop()
+        time.sleep(0.15)
+        is_turning = False
+
+
+def turn_to_cardinal(cardinal_heading, power=TURN_POWER):
+    """Snaps heading to 0, 90, 180, or 270 degrees via minimal rotation."""
+    cur_theta = motion_state()[2]
+    diff = wrap180(cardinal_heading - cur_theta)
+    turn_by(diff, power=power)
+
+
+def back_up(distance_cm):
+    """Reverses straight back by distance_cm."""
+    start_travel = motion_state()[5]
+    left_motor.set_power(-CREEP_POWER)
+    right_motor.set_power(-CREEP_POWER)
+    try:
+        while motion_state()[5] - start_travel < distance_cm:
+            time.sleep(LOOP_SECONDS)
+    finally:
+        stop()
+        time.sleep(0.15)
+
+
+def creep_forward(distance_cm):
+    """Advances forward by distance_cm at creep power."""
+    start_travel = motion_state()[5]
+    left_motor.set_power(CREEP_POWER)
+    right_motor.set_power(CREEP_POWER)
+    try:
+        while motion_state()[5] - start_travel < distance_cm:
+            time.sleep(LOOP_SECONDS)
+    finally:
+        stop()
+        time.sleep(0.1)
+
+
+# =======================================================================
+# 10. SIDE WALL FOLLOWING & SQUARING RECOVERY
+# =======================================================================
+def compute_side_wall_bias():
+    """
+    Computes steering bias from side ultrasonic sensor.
+    Dynamically inverts behavior based on SIDE_SENSOR_ORIENTATION ("right" vs "left").
+    """
+    dist = get_filtered_distance()
+
+    # Beyond detection limit or open corridor: zero bias, rely on cardinal heading
+    if dist > US_TOO_FAR:
+        return 0.0
+
+    # Error relative to centered channel distance (5.0 cm)
+    error = dist - US_BAND_CENTER
+
+    # Determine direction factor:
+    # If sensor on RIGHT:
+    #   too far (error > 0)  -> steer right (bias > 0)
+    #   too close (error < 0)-> steer left  (bias < 0)
+    # If sensor on LEFT:
+    #   too far (error > 0)  -> steer left  (bias < 0)
+    #   too close (error < 0)-> steer right (bias > 0)
+    side_mult = 1.0 if SIDE_SENSOR_ORIENTATION == "right" else -1.0
+    bias = side_mult * (SIDE_WALL_KP * error)
+
+    # Emergency safety clamp if dangerously close to the wall (2.0 cm)
+    if dist <= US_TOO_CLOSE:
+        bias = -side_mult * MAX_WALL_BIAS
+
+    return max(-MAX_WALL_BIAS, min(MAX_WALL_BIAS, bias))
+
+
+def snap_to_line(target_heading, line_coord, pivot_deg, leg_distance):
+    """
+    Performs Lab 3 line snap:
+    1. Resets the travel coordinate to (line_coord - SENSOR_OFFSET).
+    2. Calculates lateral drift across the leg: drift = leg_distance * sin(approach_tilt).
+    3. Corrects the lateral coordinate and snaps heading theta to target_heading.
+    """
+    global x, y, theta
+    h = int(round(target_heading)) % 360
+    hx = round(math.sin(math.radians(h)))
+    hy = round(math.cos(math.radians(h)))
+
+    drift = 0.0
+    if APPLY_LATERAL_DRIFT:
+        tilt = -math.radians(pivot_deg * (1.0 + ALIGN_LEVER_RATIO))
+        drift = leg_distance * math.sin(tilt)
+        drift = max(-MAX_LATERAL_DRIFT_CM, min(MAX_LATERAL_DRIFT_CM, drift))
+
+    with odo_lock:
+        update_odometer_locked()
+        if h in (0, 180):
+            y = line_coord - hy * SENSOR_OFFSET
+            x += drift * hy
+        else:
+            x = line_coord - hx * SENSOR_OFFSET
+            y -= drift * hx
+        theta = float(h)
+
+    return drift
+
+
+# =======================================================================
+# 11. CORRIDOR DRIVING & MAPPING LOOP
+# =======================================================================
+def drive_corridor_mapping(target_heading):
+    """
+    Drives along cardinal axis:
+      - Steers with heading lock + side ultrasonic bias.
+      - Squaring up at grid lines: one motor stops, trailing motor creeps, snaps odometry.
+      - Front touch bumper contact:
+          1. Reads side ultrasonic distance BEFORE backing up.
+          2. Backs up by BUMP_BACKUP_CM.
+          3. Evaluates if side wall exists to decide whether path continues Left or Right.
+    """
+    print(f"\n--> Mapping along heading {target_heading:.0f} deg...")
+    is_y = int(round(target_heading)) % 180 == 0
+    fwd_sign = 1 if int(round(target_heading)) in (0, 90) else -1
+
+    def forward_coord(s):
+        return s[1] if is_y else s[0]
+
+    state = motion_state()
+    start_fwd = forward_coord(state)
+    last_line_travel = state[5]
+    align = None
+    next_line_time = 0.0
+
+    try:
+        while True:
+            now = time.monotonic()
+            state = motion_state()
+
+            # -----------------------------------------------------------
+            # A. FRONT BUMPER COLLISION CHECK
+            # -----------------------------------------------------------
+            if is_touch_bumped():
+                stop()
+                print("!!! FRONT BUMPER HIT WALL !!!")
+
+                # Step 1: Read side distance BEFORE backing up
+                side_reading = get_filtered_distance()
+                wall_present_on_sensor_side = (side_reading <= WALL_DETECT_THRESHOLD_CM)
+                print(f"--> Side Distance before backup: {side_reading:.1f} cm (Wall present: {wall_present_on_sensor_side})")
+
+                # Step 2: Log front wall position in map
+                bump_fwd = forward_coord(state) + fwd_sign * TOUCH_SENSOR_OFFSET_CM
+                wall_grid_coord = round(bump_fwd / TILE)
+                print(f"--> Wall detected at grid line: {wall_grid_coord} tiles")
+                discovered_walls.add((target_heading, wall_grid_coord))
+
+                # Step 3: Back up to clear chassis from wall
+                back_up(BUMP_BACKUP_CM)
+
+                # Step 4: Determine next turn direction
+                # Logic:
+                # If sensor is on RIGHT:
+                #   Wall on right -> Right is blocked -> Turn LEFT (-90)
+                #   Open on right -> Turn RIGHT (+90)
+                # If sensor is on LEFT:
+                #   Wall on left  -> Left is blocked  -> Turn RIGHT (+90)
+                #   Open on left  -> Turn LEFT (-90)
+                if SIDE_SENSOR_ORIENTATION == "right":
+                    chosen_turn = -90.0 if wall_present_on_sensor_side else 90.0
+                else:
+                    chosen_turn = 90.0 if wall_present_on_sensor_side else -90.0
+
+                next_heading = (target_heading + chosen_turn) % 360.0
+                print(f"--> Path decision: Turning {chosen_turn:+.0f} deg to heading {next_heading:.0f} deg")
+                return next_heading
+
+            # -----------------------------------------------------------
+            # B. PERPENDICULAR LINE SQUARING
+            # -----------------------------------------------------------
+            can_look = (align is not None or (
+                now >= next_line_time and
+                (state[5] - last_line_travel) >= DISTANCE_NO_LOOKING_FOR_LINE
+            ))
+
+            l_on = on_line(left_light) if can_look else False
+            r_on = on_line(right_light) if can_look else False
+
+            # Trigger squaring when crossing perpendicular grid line
+            if align is None and (l_on or r_on):
+                sensor_pos = forward_coord(state) + fwd_sign * SENSOR_OFFSET
+                nearest_line = round(sensor_pos / TILE) * TILE
+                if abs(sensor_pos - nearest_line) <= PERP_LINE_TOLERANCE_CM:
+                    align = {
+                        "L": l_on, "R": r_on,
+                        "line": nearest_line,
+                        "theta": state[2],
+                        "time": now,
+                        "leg_dist": abs(forward_coord(state) - start_fwd)
+                    }
+
+            if align is None:
+                # Normal Cruise: P-heading lock + Side Distance bias
+                h_err = wrap180(target_heading - state[2])
+                wall_bias = compute_side_wall_bias()
+
+                total_steer = max(-8, min(8, 1.3 * h_err + wall_bias))
+                left_motor.set_power(int(round(DRIVE_POWER + total_steer)))
+                right_motor.set_power(int(round(DRIVE_POWER - total_steer)))
+
+            else:
+                # Line Squaring: Stop the first wheel that hits, creep the other
+                align["L"] = align["L"] or l_on
+                align["R"] = align["R"] or r_on
+                left_motor.set_power(0 if align["L"] else ALIGN_POWER)
+                right_motor.set_power(0 if align["R"] else ALIGN_POWER)
+
+                pivot = wrap180(state[2] - align["theta"])
+
+                if align["L"] and align["R"]:
+                    stop()
+                    time.sleep(0.05)
+                    pivot = wrap180(motion_state()[2] - align["theta"])
+                    drift = snap_to_line(target_heading, align["line"], pivot, align["leg_dist"])
+                    print(f"--> Line at {align['line']:.1f} cm snapped! Pivot: {pivot:+.1f} deg | Drift: {drift:+.2f} cm")
+
+                    state = motion_state()
+                    last_line_travel = state[5]
+                    start_fwd = forward_coord(state)
+                    next_line_time = now + LINE_COOLDOWN_SECONDS
+                    align = None
+
+                elif (now - align["time"]) > 2.5:
+                    # Timeout safeguard
+                    align = None
+                    next_line_time = now + LINE_COOLDOWN_SECONDS
+
+            time.sleep(LOOP_SECONDS)
+
+    finally:
+        stop()
+
+
+def run_mapping_phase():
+    """Top-level mapping loop: visits walls, logs edges, and handles turns."""
+    print("\n==============================================")
+    print(f"=== STARTING MAPPING PHASE (Side Sensor: {SIDE_SENSOR_ORIENTATION.upper()}) ===")
+    print("==============================================")
+
+    current_heading = 0.0  # Start facing North (+Y)
+
+    # Example: Map 4 consecutive boundary legs
+    for leg in range(1, 5):
+        print(f"\n--- Mapping Leg {leg}/4 ---")
+        turn_to_cardinal(current_heading)
+        next_heading = drive_corridor_mapping(current_heading)
+        current_heading = next_heading
+
+    print("\n==============================================")
+    print("MAPPING RUN COMPLETE!")
+    print(f"Discovered Walls (Heading, Grid Tile): {discovered_walls}")
+    print("==============================================\n")
+
+
+# =======================================================================
+# 12. CALIBRATION ROUTINES
+# =======================================================================
+def calibrate_turn_routine():
+    """
+    Calibrates TRACK_WIDTH and turn factors.
+    Supports angles > 360 degrees (e.g. 720, 1080) for precision tuning.
+    """
+    print("\n--- MULTI-ROTATION TURN CALIBRATION ---")
+    print(f"Target Angle: {CALIB_TURN_ANGLE:.1f} deg | Power: {CALIB_TURN_POWER}")
+    input("Place robot with reference pointer aligned on line. Press ENTER to start turn...")
+
+    start_s = motion_state()
+    turn_by(CALIB_TURN_ANGLE, power=CALIB_TURN_POWER)
+    end_s = motion_state()
+
+    odo_deg = abs(encoder_heading_change(end_s[3] - start_s[3], end_s[4] - start_s[4]))
+    print(f"\nTurn Finished:")
+    print(f"  Target:            {CALIB_TURN_ANGLE:.2f} deg")
+    print(f"  Odometer Measured: {odo_deg:.2f} deg")
+    ratio = odo_deg / CALIB_TURN_ANGLE
+    print(f"  Scale Correction:  Multiply TURN_FACTOR by {ratio:.4f}")
+    print("Adjust RIGHT_TURN_FACTOR or TRACK_WIDTH in script constants.")
+
+
+def calibrate_straight_routine():
+    """
+    Drives forward for CALIB_STRAIGHT_TILES.
+    Compares left vs right wheel encoder travel to tune RIGHT_WHEEL_SCALE.
+    """
+    print("\n--- STRAIGHT DRIVE & MOTOR BALANCE CALIBRATION ---")
+    dist_cm = CALIB_STRAIGHT_TILES * TILE
+    print(f"Driving straight for {dist_cm:.1f} cm ({CALIB_STRAIGHT_TILES} tiles)...")
+    input("Align robot on grid line. Press ENTER to drive...")
+
+    start_s = motion_state()
+    left_motor.set_power(DRIVE_POWER)
+    right_motor.set_power(DRIVE_POWER)
+
+    try:
+        while motion_state()[5] - start_s[5] < dist_cm:
+            time.sleep(LOOP_SECONDS)
+    finally:
+        stop()
+
+    end_s = motion_state()
+    dl = end_s[3] - start_s[3]
+    dr = end_s[4] - start_s[4]
+    print(f"\nStraight Test Complete:")
+    print(f"  Left Wheel Traveled:  {dl:.2f} cm")
+    print(f"  Right Wheel Traveled: {dr:.2f} cm")
+    print(f"  Ratio (Left / Right): {dl / dr if dr != 0 else 0:.4f}")
+    print("Update RIGHT_WHEEL_SCALE to equalize both wheels.")
+
+
+def calibrate_light_squaring_routine():
+    """
+    Drives forward, hits a line, performs one-motor squaring, executes drift math,
+    prints full alignment diagnostics, and advances forward to test the next line.
+    """
+    print("\n--- LIGHT SENSORS & LINE SQUARING CALIBRATOR ---")
+    print("Robot will advance, square up on line, print error math, and stop.")
+    input("Place robot 15-20 cm behind a dark grid line. Press ENTER...")
+
+    state = motion_state()
+    start_fwd = state[1]
+    align = None
+
+    left_motor.set_power(DRIVE_POWER)
+    right_motor.set_power(DRIVE_POWER)
+
+    try:
+        while True:
+            l_on = on_line(left_light)
+            r_on = on_line(right_light)
+
+            if align is None and (l_on or r_on):
+                align = {
+                    "L": l_on, "R": r_on,
+                    "theta": motion_state()[2],
+                    "time": time.monotonic(),
+                    "leg_dist": abs(motion_state()[1] - start_fwd)
+                }
+
+            if align is not None:
+                align["L"] = align["L"] or l_on
+                align["R"] = align["R"] or r_on
+                left_motor.set_power(0 if align["L"] else ALIGN_POWER)
+                right_motor.set_power(0 if align["R"] else ALIGN_POWER)
+
+                if align["L"] and align["R"]:
+                    stop()
+                    time.sleep(0.1)
+                    pivot = wrap180(motion_state()[2] - align["theta"])
+                    tilt_deg = -pivot * (1.0 + ALIGN_LEVER_RATIO)
+                    drift_cm = align["leg_dist"] * math.sin(math.radians(tilt_deg))
+                    print("\n--> SQUARING COMPLETE!")
+                    print(f"  Pivot Angle Difference: {pivot:+.2f} deg")
+                    print(f"  Calculated Approach Tilt:{tilt_deg:+.2f} deg")
+                    print(f"  Leg Distance Traveled:  {align['leg_dist']:.2f} cm")
+                    print(f"  Computed Lateral Drift: {drift_cm:+.2f} cm")
+
+                    # Advance post-line distance
+                    print(f"  Creeping post-line distance: {POST_LINE_FORWARD_CM:.1f} cm")
+                    creep_forward(POST_LINE_FORWARD_CM)
+                    print("  Ready for turn or next action.\n")
+                    break
+
+            time.sleep(LOOP_SECONDS)
+
+    finally:
+        stop()
+
+
+# =======================================================================
+# 13. MAIN ENTRY POINT
+# =======================================================================
+if __name__ == "__main__":
+    odo_thread = None
+    try:
+        init_odometer()
+
+        # Prime light sensor buffers
+        for _ in range(LIGHT_FILTER_SAMPLES):
+            get_filtered_light(left_light)
+            get_filtered_light(right_light)
+            time.sleep(0.01)
+
+        # Start continuous background odometry
+        odo_thread = Thread(target=odometer_thread_loop, daemon=True)
+        odo_thread.start()
+
+        # Execute chosen operational mode
+        if RUN_MODE == "map":
+            run_mapping_phase()
+        elif RUN_MODE == "calibrate_turn":
+            calibrate_turn_routine()
+        elif RUN_MODE == "calibrate_straight":
+            calibrate_straight_routine()
+        elif RUN_MODE == "calibrate_light_squaring":
+            calibrate_light_squaring_routine()
+        else:
+            raise ValueError(f"Unknown RUN_MODE: {RUN_MODE}")
+
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user.")
+    finally:
+        stop()
+        shutdown.set()
+        if odo_thread:
+            odo_thread.join(timeout=0.3)
+        reset_brick()
+        print("Brick reset and motors safely stopped.")
