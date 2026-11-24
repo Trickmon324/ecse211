@@ -23,20 +23,95 @@ def clamp(x, limit):
     return max(-limit,min(x,limit))
 
 
-class Hardware:
+class MotorDrive:
+    """Direct BrickPi power commands with encoder feedback in Robot."""
     def __init__(self):
-        from utils.brick import Motor, EV3ColorSensor, TouchSensor, EV3UltrasonicSensor, wait_ready_sensors
-        self.motors = [Motor(p) for p in (S.LEFT_PORT,S.RIGHT_PORT)]
-        self.lights = [EV3ColorSensor(p) for p in (S.LEFT_LIGHT_PORT,S.RIGHT_LIGHT_PORT)]
-        self.touch = TouchSensor(S.TOUCH_PORT)
-        self.us = EV3UltrasonicSensor(S.US_PORT)
-        wait_ready_sensors()
+        from utils.brick import Motor
+
+        self.ports = (S.LEFT_PORT, S.RIGHT_PORT)
+        self.signs = (S.LEFT_SIGN, S.RIGHT_SIGN)
+        self.trims = (S.LEFT_TRIM, S.RIGHT_TRIM)
+        self.motors = [Motor(port) for port in self.ports]
+        self.commands = [None, None]
+        self.stop()
+
     def enc(self):
-        return [m.get_encoder()*s for m,s in zip(self.motors,(S.LEFT_SIGN,S.RIGHT_SIGN))]
-    def power(self,l,r):
-        for m,p,s,t in zip(self.motors,(l,r),(S.LEFT_SIGN,S.RIGHT_SIGN),(S.LEFT_TRIM,S.RIGHT_TRIM)):
-            m.set_power(int(s*math.copysign(min(100,max(0,abs(p)+t)),p)) if p else 0)
+        values = []
+        for motor, port, sign in zip(self.motors, self.ports, self.signs):
+            value = motor.get_encoder()
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise RuntimeError(f"Motor {port} encoder reading unavailable")
+            values.append(value * sign)
+        return values
+
+    def power(self, left, right):
+        for i, (motor, demand) in enumerate(zip(self.motors, (left, right))):
+            magnitude = max(0, abs(demand) + self.trims[i]) if demand else 0
+            limit = S.MAX_MOTOR_POWER
+            signed = int(math.copysign(round(min(limit, magnitude)), demand)) * self.signs[i]
+            if signed != self.commands[i]:
+                motor.set_power(signed)
+                self.commands[i] = signed
+
+    def stop(self):
+        # Try the other wheel even if the first command fails.
+        try:
+            self.motors[0].set_power(0)
+        finally:
+            self.commands = [None, None]
+            self.motors[1].set_power(0)
+
+    def describe(self, i):
+        side = ("left", "right")[i]
+        flags, output, encoder, dps = self.motors[i].get_status()
+        label = f"{side} motor {self.ports[i]}"
+        if flags is None:
+            return f"{label}: BrickPi status unavailable"
+        if flags & 1:
+            return f"{label}: LOW VOLTAGE (BrickPi disabled motor output)"
+        return (f"{label}: asked {self.commands[i]}%, BrickPi output {output}%, "
+                f"encoder {encoder} deg, speed {dps} deg/s")
+
+    def bench_test(self):
+        """Exercise the same direct power commands as the mapping run."""
+        print("Testing each wheel by itself. Look for forward rotation.")
+        passed = True
+        try:
+            for i, port in enumerate(self.ports):
+                before = self.enc()[i]
+                try:
+                    demand = [0, 0]
+                    demand[i] = S.DRIVE
+                    self.power(*demand)
+                    time.sleep(.55)
+                    delta = self.enc()[i] - before
+                    status = self.describe(i)
+                finally:
+                    self.stop()
+                if delta < 3:
+                    passed = False
+                print(f"{port}: encoder change {delta:+.0f} deg | {status}")
+            print("Motor test passed." if passed else
+                  "Motor test failed. Check the output and encoder direction printed above.")
+        finally:
+            self.stop()
+
+
+class Hardware(MotorDrive):
+    def __init__(self, *, use_bumper=True):
+        from utils.brick import EV3ColorSensor, TouchSensor, EV3UltrasonicSensor
+
+        super().__init__()
+        self.lights = [EV3ColorSensor(p) for p in (S.LEFT_LIGHT_PORT, S.RIGHT_LIGHT_PORT)]
+        self.touch = TouchSensor(S.TOUCH_PORT) if use_bumper else None
+        self.us = EV3UltrasonicSensor(S.US_PORT)
+        for sensor in [*self.lights, self.us, self.touch]:
+            if sensor is not None:
+                sensor.wait_ready()
+
     def pressed(self):
+        if self.touch is None:
+            return False
         v = self.touch.get_value()
         if v not in (0,1):
             raise RuntimeError("Touch sensor unavailable")
@@ -66,7 +141,9 @@ class Robot:
         self.last_alignment=None
         self.h=S.START_HEADING
         self.enc=hw.enc()
-        self.last_move=hw.now()
+        self.wheel_commands = (0, 0)
+        self.last_move = [hw.now(), hw.now()]
+        self.motion = "idle"
         self.reset_filters()
 
     def reset_filters(self):
@@ -94,29 +171,78 @@ class Robot:
         self.y+=(dl+dr)/2*f[1]
         self.travel+=(abs(dl)+abs(dr))/2
         self.h+=delta  # deliberately unwrapped for multi-revolution turns
-        if dl or dr:
-            self.last_move=now
-        if now-self.last_move>S.STALL_SECONDS:
-            raise RuntimeError("Wheels stalled")
+        stalled = []
+        for i, (demand, distance) in enumerate(zip(self.wheel_commands, (dl, dr))):
+            if not demand or distance:
+                self.last_move[i] = now
+            elif now - self.last_move[i] >= S.STALL_SECONDS:
+                stalled.append(i)
+        if stalled:
+            reporter = getattr(self.hw, "describe", None)
+            details = [reporter(i) if reporter else ("left wheel", "right wheel")[i]
+                       for i in stalled]
+            self.stop()
+            raise RuntimeError(f"No encoder movement during {self.motion}. " + " | ".join(details))
+
+    def command(self, left, right, *, motion):
+        now = self.hw.now()
+        for i, demand in enumerate((left, right)):
+            if demand * self.wheel_commands[i] <= 0:
+                self.last_move[i] = now
+        self.wheel_commands = (left, right)
+        self.motion = motion
+        self.hw.power(left, right)
 
     def stop(self):
-        self.hw.power(0,0)
+        self.wheel_commands = (0, 0)
+        self.hw.power(0, 0)
 
-    def turn(self,angle,power=S.TURN):
-        target=self.h+angle
+    def turn(self, angle, power=S.TURN):
+        target = self.h + angle
         self.stop()
-        self.last_move=self.hw.now()
-        # Only encoder and bumper reads here. Side history belongs to a straight leg.
-        while abs(target-self.h)>S.TURN_TOLERANCE:
-            if self.hw.pressed():
-                raise RuntimeError("Contact during turn")
-            e=target-self.h
-            p=math.copysign(min(power,max(min(S.TURN_MIN,power),power*abs(e)/S.TURN_SLOW_ZONE)),e)
-            self.hw.power(p,-p)
-            self.tick()
-        self.stop()
-        self.hw.sleep(S.TURN_SETTLE)
-        self.tick()
+        # Keep sonar readings for straight driving only.
+        pulse_seconds = S.TURN_PULSE_SECONDS
+        best_error = S.TURN_FINE_ZONE
+        remaining_pulses = S.TURN_MAX_PULSES
+        try:
+            while True:
+                error = target - self.h
+                if abs(error) <= S.TURN_TOLERANCE:
+                    break
+                if self.hw.pressed():
+                    raise RuntimeError("Contact during turn")
+
+                # Full power gets the turn moving. Close to the target, use
+                # short pulses at usable torque and re-read after braking.
+                fine = abs(error) <= S.TURN_FINE_ZONE
+                magnitude = min(power, S.TURN_MIN) if fine else power
+                demand = math.copysign(magnitude, error)
+                self.command(demand, -demand, motion="turn")
+                self.tick()
+                if fine:
+                    elapsed = S.SAMPLE_S
+                    while elapsed + S.SAMPLE_S / 2 < pulse_seconds:
+                        if self.hw.pressed():
+                            raise RuntimeError("Contact during turn")
+                        self.tick()
+                        elapsed += S.SAMPLE_S
+                    self.stop()
+                    self.hw.sleep(S.TURN_SETTLE)
+                    self.tick()
+                    remaining = target - self.h
+                    if remaining * error < 0:
+                        pulse_seconds = max(S.SAMPLE_S, pulse_seconds / 2)
+                    elif abs(remaining - error) < .2:
+                        pulse_seconds = min(.12, pulse_seconds * 1.5)
+                    if abs(remaining) < best_error - .2:
+                        best_error = abs(remaining)
+                        remaining_pulses = S.TURN_MAX_PULSES
+                    else:
+                        remaining_pulses -= 1
+                    if not remaining_pulses and abs(remaining) > S.TURN_TOLERANCE:
+                        raise RuntimeError(f"Could not finish turn. Remaining angle {remaining:+.1f} deg.")
+        finally:
+            self.stop()
         self.reset_filters()
 
     def face(self,h):
@@ -158,7 +284,8 @@ class Robot:
                 return False
             if self.hw.now()-start>S.ALIGN_TIMEOUT or abs(self.h-h0)>S.MAX_PIVOT:
                 raise RuntimeError("Grid-line alignment exceeded limit")
-            self.hw.power(0 if first==0 else S.ALIGN,S.ALIGN if first==0 else 0)
+            self.command(0 if first == 0 else S.ALIGN,
+                         S.ALIGN if first == 0 else 0, motion="line squaring")
             self.tick()
             self.light_state()
             self.black[first]=True
