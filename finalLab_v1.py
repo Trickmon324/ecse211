@@ -12,6 +12,7 @@ Coordinates are grid points, exactly as the facilitator gives them.
 """
 import heapq
 import json
+from collections import deque
 import math
 import sys
 import time
@@ -45,18 +46,32 @@ ULTRASONIC_PORT = 3
 LEFT_LIGHT_PORT = 4
 
 # ---------------------------------------------------------------------------
-# Robot geometry (TODO: measure on the new robot; these are Lab 4 values)
-# Positions are tracked at the midpoint of the drive-wheel axle.
+# Robot geometry. TODO: measure every value marked TODO on the new robot.
+#
+# The drive wheels are at the BACK and the steel ball at the FRONT. The robot
+# turns in place around the midpoint between the two drive wheels (the
+# "axle"), and every position in this program is the position of that point.
+# All body measurements below are taken from the axle.
 # ---------------------------------------------------------------------------
-WHEEL_RADIUS = 2.1          # cm
+WHEEL_RADIUS = 2.1          # TODO cm (RUN_MODE = "calibrate_straight" suggests a value)
 RIGHT_WHEEL_SCALE = 1.0
-TRACK_WIDTH = 13.5          # cm between the two drive wheels
-RIGHT_TURN_FACTOR = 1.0     # from RUN_MODE = "calibrate_turn"
-LEFT_TURN_FACTOR = 1.0
-SENSOR_OFFSET = 4.0         # cm the light sensors sit ahead of the axle
-SENSOR_SEPARATION = 6.3     # cm between the two light sensors
-TOUCH_REACH_CM = 13.0       # cm from the axle to the tip of the touch rod
-US_SIDE_OFFSET_CM = 10.0    # cm from the robot's centre line to the ultrasonic face
+TRACK_WIDTH = 15          # TODO cm between the centres of the two drive wheels
+RIGHT_TURN_FACTOR = 1.0     # TODO from RUN_MODE = "calibrate_turn"
+LEFT_TURN_FACTOR = 1.0      # TODO from RUN_MODE = "calibrate_turn"
+SENSOR_OFFSET = 4.0        # TODO cm the light sensors sit ahead of the axle
+SENSOR_SEPARATION = 6.3     # TODO cm between the two light sensors
+
+AXLE_TO_FRONT_CM = 11.0     # TODO axle to the frontmost point (funnel tips, paddle, ball)
+AXLE_TO_REAR_CM = 5.0       # TODO axle to the back of the container (the gate)
+BODY_HALF_WIDTH_CM = 8.75   # half the body width (robot is 17.5 cm wide)
+FRONT_HALF_WIDTH_CM = 8.75  # TODO half the width across the funnel tips
+TOUCH_REACH_CM = 19.0       # TODO axle to the tip of the touch rod; must stick out past
+                            # the front (the old file's 11 cm can't be right with
+                            # the wheels at the back)
+US_SIDE_OFFSET_CM = 9.0     # TODO robot's centre line to the ultrasonic sensor's face
+US_FORWARD_CM = 6.0         # TODO how far the ultrasonic sits ahead of the axle
+WALL_CLEARANCE_CM = 1.0     # gap to keep from any wall while turning
+END_CLEARANCE_CM = 2.5      # gap left in front when stopping at a dead end
 TILE = 30.48
 
 START_X = 0.0
@@ -90,7 +105,7 @@ PADDLE_OFF_AFTER_STREET = False   # True = stop the wheel once out of the street
 GATE_POWER = 35
 GATE_OPEN_DEGREES = 90.0     # flip the sign if the gate opens the wrong way
 GATE_TIMEOUT_S = 3.0
-DROP_BACKUP_CM = 3.0         # how far to reverse toward the bucket before opening
+DROP_EDGE_GAP_CM = 2.0      # gap left between the back of the robot and the bucket
 WIGGLE_COUNT = 3
 WIGGLE_CM = 2.0
 GATE_OPEN_WAIT_S = 1.0
@@ -107,34 +122,49 @@ MIN_LEG_CM = 3.0
 SETTLE_AT_TARGET = True
 AXIS_ORDER = "auto"
 
+# Minimum powers raised to about 20 (from the teammate's tuning): lower powers
+# don't overcome friction on the new robot.
 DRIVE_POWER = 30            # Lab 4 used 15; at 15 each phase runs over 2 minutes
-START_POWER = 8
+REVERSE_POWER = 24
+START_POWER = 18
 ACCEL_STEP = 0.1
 SLOW_DOWN_CM = 8.0
-SLOW_POWER = 12
-CREEP_POWER = 10
+SLOW_POWER = 20
+CREEP_POWER = 20
 HEADING_KP = 1.4
 CROSS_TRACK_KP = 1.8
 MAX_CORRECTION = 8
 
+# Anti-stall: if the wheels stop moving, add power in steps (teammate's idea)
+STALL_CHECK_S = 0.35
+STALL_MOVE_CM = 0.25
+STALL_BOOST_STEP = 5
+STALL_MAX_BOOST = 16
+
 TURN_POWER = 30
-TURN_MIN_POWER = 14
+TURN_MIN_POWER = 20
 TURN_RAMP_DEG = 10.0
 TURN_SLOW_DEG = 40.0
 TURN_TOLERANCE_DEG = 0.5
 TURN_COAST_DEG = 1.5
-TURN_NUDGE_POWER = 16
+TURN_NUDGE_POWER = 22
 TURN_NUDGE_SECONDS = 0.04
 TURN_MAX_NUDGES = 12
 TURN_SETTLE_SECONDS = 0.15
-TURN_180_DIRECTION = 1       # 1 = 180s turn clockwise, -1 = counter-clockwise
+TURN_180_DIRECTION = 1       # preferred 180 direction when both sides are clear
+TURN_STUCK_S = 0.6           # Phase 1: a turn that stops rotating this long hit a wall
+TURN_UNSTICK_CM = 2.0        # how far to back off when a turn gets caught
+TURN_TIMEOUT_S = 8.0
 
-# Light sensors (TODO: re-check; the ports swapped sides since Lab 4)
+# Light sensors. TODO: check with RUN_MODE = "test_sensors". The teammate's file
+# had the light ports the other way round (left = 1, right = 4): check which
+# sensor is really in port 1.
 WHITE_LEFT = 380
 WHITE_RIGHT = 370
-LINE_DROP = 200
+LINE_DROP = 130              # teammate's tuned value
+LIGHT_FILTER_SAMPLES = 3     # median of the last few readings (rejects dust)
 PERP_LINE_TOLERANCE_CM = 7.0
-ALIGN_POWER = 15
+ALIGN_POWER = 22
 MAX_ALIGN_PIVOT_DEG = 12.0
 APPLY_LATERAL_DRIFT = True
 MAX_LATERAL_DRIFT_CM = 3.0
@@ -148,7 +178,7 @@ CALIBRATE_DIRECTION = "both"
 CALIBRATE_ANGLE = 360.0
 CALIBRATE_REPEATS = 3
 CALIBRATE_BACKUP_CM = 8.0
-CALIBRATE_SQUARE_POWER = 12
+CALIBRATE_SQUARE_POWER = 20
 CALIBRATE_DISTANCE_TILES = 3
 
 DISPLAY_POSITION = True
@@ -260,9 +290,22 @@ def display_loop():
 # ===========================================================================
 # Light sensors (Lab 3 / Lab 4)
 # ===========================================================================
+_light_history = {}
+
+
 def read_light(sensor):
+    """R+G+B total, as the median of the last few readings."""
     rgb = sensor.get_value()
-    return sum(rgb[:3]) if rgb is not None and len(rgb) >= 3 else None
+    if rgb is None or len(rgb) < 3 or any(v is None for v in rgb[:3]):
+        return None
+    total = float(sum(rgb[:3]))
+    now = time.monotonic()
+    hist, last = _light_history.get(id(sensor), (None, 0.0))
+    if hist is None or now - last > 0.1:          # stale readings: start over
+        hist = deque(maxlen=LIGHT_FILTER_SAMPLES)
+    hist.append(total)
+    _light_history[id(sensor)] = (hist, now)
+    return sorted(hist)[len(hist) // 2]
 
 
 def on_line(sensor):
@@ -391,11 +434,102 @@ def forward_coord(heading, state=None):
 
 
 # ===========================================================================
+# Turning geometry for a robot whose drive wheels are at the back
+# ===========================================================================
+def corner_reach():
+    """Distance from the axle to the farthest front corner (funnel tips)."""
+    return math.hypot(AXLE_TO_FRONT_CM, FRONT_HALF_WIDTH_CM)
+
+
+def turn_setback():
+    """
+    How far behind a square's centre the axle stops before turning 90 degrees
+    when the square ahead is a wall. The front corners swing out to
+    corner_reach() while turning, so the axle has to be far enough from the
+    wall ahead; but the robot then sets off sideways-offset by the same amount
+    in the new direction, so it can't be too far back either. The middle of
+    that window leaves the same clearance on both sides.
+    """
+    too_close = corner_reach() + WALL_CLEARANCE_CM - TILE / 2
+    if too_close <= 0:
+        return 0.0
+    too_far = TILE / 2 - WALL_CLEARANCE_CM - max(FRONT_HALF_WIDTH_CM, BODY_HALF_WIDTH_CM)
+    return (too_close + too_far) / 2.0
+
+
+def end_setback():
+    """How far behind a square's centre the axle stops facing a wall (no turn)."""
+    return max(0.0, AXLE_TO_FRONT_CM + END_CLEARANCE_CM - TILE / 2)
+
+
+def geometry_report():
+    s = turn_setback()
+    front_gap = TILE / 2 + s - corner_reach()
+    side_gap = TILE / 2 - s - max(FRONT_HALF_WIDTH_CM, BODY_HALF_WIDTH_CM)
+    print("Geometry: corner reach %.1f cm, corner setback %.1f cm "
+          "-> %.1f cm from the wall ahead, %.1f cm from the side wall after the turn"
+          % (corner_reach(), s, front_gap, side_gap))
+    if min(front_gap, side_gap) < 0.5:
+        print("WARNING: the robot is too long for clean corner turns in a 30.48 cm street.")
+        print("         Need corner reach + front half-width below %.1f cm (now %.1f)."
+              % (TILE - 1.0, corner_reach() + max(FRONT_HALF_WIDTH_CM, BODY_HALF_WIDTH_CM)))
+    if TOUCH_REACH_CM < AXLE_TO_FRONT_CM + 0.5:
+        print("WARNING: the touch rod (%.1f cm) doesn't reach past the front (%.1f cm):"
+              " the body will hit walls before the rod does." % (TOUCH_REACH_CM, AXLE_TO_FRONT_CM))
+    us_from_wall = TILE / 2 + s - US_FORWARD_CM
+    if not 8.0 <= us_from_wall <= TILE - 8.0:
+        print("WARNING: at a corner the ultrasonic sits %.1f cm from the wall ahead, too"
+              " close to the next square to read the right side reliably." % us_from_wall)
+    if corner_reach() > TILE / 2 - WALL_CLEARANCE_CM:
+        print("Note: the robot can't turn around inside the street, so it reverses out of"
+              " dead ends.")
+
+
+def side_free(cell, heading, blocked):
+    nb = step(cell, heading)
+    return in_bounds(nb) and nb not in blocked
+
+
+def leg_stop_point(cell, heading, next_heading, blocked):
+    """Where the axle stops at the end of a leg into `cell`."""
+    cx, cy = cell_center(cell)
+    ahead = step(cell, heading)
+    if in_bounds(ahead) and ahead not in blocked:
+        return cx, cy
+    back = end_setback() if next_heading is None else turn_setback()
+    hx, hy = DIRS[grid_heading(heading)]
+    return cx - hx * back, cy - hy * back
+
+
+# ===========================================================================
 # Motion (Lab 4, with a stop check for the touch sensor)
 # ===========================================================================
 def stop():
     left_motor.set_power(0)
     right_motor.set_power(0)
+
+
+class StallBoost:
+    """Extra power, added in steps, while the wheels aren't moving."""
+    def __init__(self):
+        self.boost = 0
+        self.last_t = time.monotonic()
+        self.last_travel = motion_state()[5]
+
+    def update(self):
+        now = time.monotonic()
+        trav = motion_state()[5]
+        if abs(trav - self.last_travel) > STALL_MOVE_CM:
+            self.last_travel, self.last_t, self.boost = trav, now, 0
+        elif now - self.last_t >= STALL_CHECK_S:
+            self.boost = min(self.boost + STALL_BOOST_STEP, STALL_MAX_BOOST)
+            self.last_t = now
+        return self.boost
+
+
+def set_powers(left, right):
+    left_motor.set_power(int(round(max(-100, min(100, left)))))
+    right_motor.set_power(int(round(max(-100, min(100, right)))))
 
 
 def drive_powers(target_heading, base_power, bias=0):
@@ -479,6 +613,7 @@ def drive_to(target_x, target_y, heading, light_correction=True, stop_check=None
     align = None
     next_wall_read = 0.0
     wall_follow = wall_follow and WALL_FOLLOW and grid_heading(heading) == int(round(heading)) % 360
+    stall = StallBoost()
 
     try:
         while True:
@@ -514,16 +649,17 @@ def drive_to(target_x, target_y, heading, light_correction=True, stop_check=None
                     "leg_distance": abs(fwd(state) - segment_start_fwd),
                 }
 
+            boost = stall.update()
             if align is None:
                 current_base_power = min(float(DRIVE_POWER), current_base_power + ACCEL_STEP)
                 arrive_cap = SLOW_POWER + (DRIVE_POWER - SLOW_POWER) * min(1.0, along / SLOW_DOWN_CM)
-                drive_powers(heading, min(current_base_power, arrive_cap),
+                drive_powers(heading, min(current_base_power, arrive_cap) + boost,
                              bias=-CROSS_TRACK_KP * lateral)
             else:
                 align["L"] = align["L"] or l_on
                 align["R"] = align["R"] or r_on
-                left_motor.set_power(0 if align["L"] else ALIGN_POWER)
-                right_motor.set_power(0 if align["R"] else ALIGN_POWER)
+                left_motor.set_power(0 if align["L"] else ALIGN_POWER + boost)
+                right_motor.set_power(0 if align["R"] else ALIGN_POWER + boost)
                 pivot = wrap180(state[2] - align["theta"])
 
                 if align["L"] and align["R"]:
@@ -558,15 +694,52 @@ def settle_on_target(target_x, target_y, heading):
             return
         direction = 1 if along > 0 else -1
         started = time.monotonic()
+        stall = StallBoost()
         try:
-            left_motor.set_power(direction * CREEP_POWER)
-            right_motor.set_power(direction * CREEP_POWER)
             while time.monotonic() - started < 3.0:
                 if leg_errors(target_x, target_y, heading)[0] * direction <= 0:
                     break
+                p = direction * (CREEP_POWER + stall.update())
+                set_powers(p, p)
                 time.sleep(LOOP_SECONDS)
         finally:
             stop()
+
+
+def reverse_to(target_x, target_y, heading, lane=None):
+    """
+    Back up in a straight line to a point behind the robot while facing
+    `heading`. Steers toward the line through the target, like drive_to.
+    With `lane` (any point on the street's centre line), it also corrects its
+    sideways position off the right wall as it goes.
+    """
+    started = time.monotonic()
+    base = float(START_POWER)
+    stall = StallBoost()
+    next_wall_read = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            if lane is not None and WALL_FOLLOW and now >= next_wall_read:
+                wall_follow_update(lane[0], lane[1], heading)
+                next_wall_read = now + WALL_FOLLOW_PERIOD_S
+            along, lateral = leg_errors(target_x, target_y, heading)
+            if along >= 0:
+                break
+            if time.monotonic() - started >= MOTION_TIMEOUT_SECONDS:
+                raise RuntimeError("Reverse movement timed out")
+            base = min(float(REVERSE_POWER), base + ACCEL_STEP)
+            cap = SLOW_POWER + (REVERSE_POWER - SLOW_POWER) * min(1.0, -along / SLOW_DOWN_CM)
+            p = min(base, cap) + stall.update()
+            # Going backwards, the sideways correction steers the other way.
+            corr = HEADING_KP * heading_error(heading) + CROSS_TRACK_KP * lateral
+            corr = max(-MAX_CORRECTION, min(MAX_CORRECTION, corr))
+            set_powers(-p + corr, -p - corr)
+            time.sleep(LOOP_SECONDS)
+    finally:
+        stop()
+    if SETTLE_AT_TARGET:
+        settle_on_target(target_x, target_y, heading)
 
 
 def drive_leg(target_x, target_y, heading, light_correction=True, wall_follow=False):
@@ -579,12 +752,16 @@ def drive_leg(target_x, target_y, heading, light_correction=True, wall_follow=Fa
 turn_coast = {1: TURN_COAST_DEG, -1: TURN_COAST_DEG}
 
 
-def turn_by(angle):
-    """Turn in place (wheels in opposite directions). Positive = clockwise."""
+def turn_by(angle, abort_if_stuck=False):
+    """
+    Turn in place (wheels in opposite directions). Positive = clockwise.
+    With abort_if_stuck, gives up and returns False if the robot stops
+    rotating (front pressed against a wall) instead of pushing harder.
+    """
     sign = 1 if angle > 0 else -1
     if abs(angle) <= TURN_TOLERANCE_DEG:
         stop()
-        return
+        return True
 
     update_odometer()
     start_state = motion_state()
@@ -595,6 +772,9 @@ def turn_by(angle):
 
     lead = turn_coast[sign]
     started = time.monotonic()
+    stall = StallBoost()
+    progress_at, progress_deg = started, 0.0
+    unsticks = 0
     try:
         powered = False
         while True:
@@ -602,11 +782,27 @@ def turn_by(angle):
             remaining = abs(angle) - done
             if remaining <= lead:
                 break
-            if time.monotonic() - started >= MOTION_TIMEOUT_SECONDS:
-                raise RuntimeError("Turn timed out")
+            now = time.monotonic()
+            if now - started >= TURN_TIMEOUT_S:
+                print("--> WARNING: turn gave up %.0f deg short" % remaining)
+                return False
+            if done - progress_deg > 1.0:
+                progress_at, progress_deg = now, done
+            elif abort_if_stuck and now - progress_at > TURN_STUCK_S:
+                print("--> Turn blocked after %.0f deg" % done)
+                return False
+            elif now - progress_at > 2 * TURN_STUCK_S and unsticks < 3:
+                # Front caught on a wall: back off a little and keep turning.
+                print("--> Turn caught on something; backing off %.0f cm" % TURN_UNSTICK_CM)
+                stop()
+                move_straight(-TURN_UNSTICK_CM)
+                unsticks += 1
+                progress_at = time.monotonic()
             ramp = min(1.0, max(0.0, done) / TURN_RAMP_DEG)
             slow = min(1.0, remaining / TURN_SLOW_DEG)
-            p = int(round(TURN_MIN_POWER + (TURN_POWER - TURN_MIN_POWER) * min(ramp, slow)))
+            boost = 0 if abort_if_stuck else stall.update()
+            p = int(round(TURN_MIN_POWER + (TURN_POWER - TURN_MIN_POWER) * min(ramp, slow)
+                          + boost))
             left_motor.set_power(sign * p)
             right_motor.set_power(-sign * p)
             powered = True
@@ -637,6 +833,7 @@ def turn_by(angle):
                 pulse = min(0.25, pulse * 1.6)
     finally:
         stop()
+    return True
 
 
 def minimal_turn(target_heading):
@@ -650,6 +847,29 @@ def turn_to_heading(target_heading):
     turn_by(minimal_turn(target_heading))
 
 
+def turn_safely(target_heading, blocked=frozenset()):
+    """
+    Like turn_to_heading, but a 180 swings the front through whichever side
+    is open (the front sweeps well outside the robot's square).
+    """
+    err = heading_error(target_heading)
+    if abs(abs(err) - 180.0) >= 1.0:
+        turn_by(err)
+        return
+    cell, h = current_cell(), grid_heading(motion_state()[2])
+    right_ok = side_free(cell, h + 90, blocked)
+    left_ok = side_free(cell, h + 270, blocked)
+    if right_ok and left_ok:
+        turn_by(180.0 * TURN_180_DIRECTION)
+    elif right_ok:
+        turn_by(180.0)
+    elif left_ok:
+        turn_by(-180.0)
+    else:
+        print("--> WARNING: turning around with walls on both sides")
+        turn_by(180.0 * TURN_180_DIRECTION)
+
+
 def move_straight(dist_cm, power=CREEP_POWER, timeout=5.0):
     """Drive a short distance without steering. Negative = backwards."""
     if abs(dist_cm) <= 0.2:
@@ -657,11 +877,12 @@ def move_straight(dist_cm, power=CREEP_POWER, timeout=5.0):
     sign = 1 if dist_cm > 0 else -1
     start_travel = motion_state()[5]
     started = time.monotonic()
+    stall = StallBoost()
     try:
-        left_motor.set_power(sign * power)
-        right_motor.set_power(sign * power)
         while (motion_state()[5] - start_travel < abs(dist_cm)
                and time.monotonic() - started < timeout):
+            p = sign * (power + stall.update())
+            set_powers(p, p)
             time.sleep(LOOP_SECONDS)
     finally:
         stop()
@@ -821,6 +1042,11 @@ def plan_route(start_cell, start_heading, goal_cell, blocked):
         if in_bounds(ahead) and (ahead not in blocked or ahead == goal_cell):
             options.append(((ahead, h), 1.0))
         for dh, c in ((90, TURN_COST), (270, TURN_COST), (180, 2 * TURN_COST)):
+            # The front swings out past the square while turning around, so a
+            # 180 needs at least one open side (never inside the street).
+            if dh == 180 and not (side_free(cell, h + 90, blocked)
+                                  or side_free(cell, h + 270, blocked)):
+                continue
             options.append(((cell, (h + dh) % 360), c))
         for nxt, c in options:
             new_cost = cost + c
@@ -857,13 +1083,43 @@ def cells_to_legs(cells):
     return legs
 
 
-def follow_legs(legs, at_stop=None):
-    for cell, h in legs:
-        turn_to_heading(h)
-        tx, ty = cell_center(cell)
+def follow_legs(legs, blocked, at_stop=None, turn_after=True):
+    """
+    Drive a list of straight legs. A leg that ends facing a wall stops short
+    (turn_setback) so the front never hits it while turning. With
+    turn_after=False the last leg only stops short enough not to hit it
+    (end_setback), for a dead end the robot will reverse out of.
+    """
+    for i, (cell, h) in enumerate(legs):
+        turn_safely(h, blocked)
+        if i + 1 < len(legs):
+            next_h = legs[i + 1][1]
+        else:
+            next_h = (h + 90) % 360 if turn_after else None
+        tx, ty = leg_stop_point(cell, h, next_h, blocked)
         drive_leg(tx, ty, h, wall_follow=True)
         if at_stop is not None:
             at_stop(cell, h)
+
+
+def reverse_out(route, blocked):
+    """
+    Back out of the street along `route` (entry square first), undoing each
+    corner turn at the same spot it was made. Used where the robot can't
+    turn around: dead ends and unfinished maps. The robot must already be in
+    the last square of the route.
+    """
+    print("--> Reversing out of the street")
+    legs = cells_to_legs(route)
+    for k in range(len(legs) - 1, -1, -1):
+        end_cell, h = legs[k]
+        turn_to_heading(h)
+        if k == 0:
+            target = cell_center(route[0])
+        else:
+            prev_cell, prev_h = legs[k - 1]
+            target = leg_stop_point(prev_cell, prev_h, h, blocked)
+        reverse_to(target[0], target[1], h, lane=cell_center(end_cell))
 
 
 def origin_cells():
@@ -873,6 +1129,12 @@ def origin_cells():
 
 def go_to_cell(goal, blocked):
     """Plan around known walls and drive to the centre of a cell."""
+    px, py = motion_state()[:2]
+    if math.hypot(px - START_X, py - START_Y) < 5.0:
+        # Sitting on the origin point, between four squares: move into the
+        # best one's centre first, or it would set off from the grid corner.
+        leave_origin(goal, blocked)
+        return
     start = current_cell()
     heading = motion_state()[2]
     result = plan_route(start, heading, goal, blocked)
@@ -880,7 +1142,7 @@ def go_to_cell(goal, blocked):
         print("--> No safe route found; driving an L-shape instead")
         travel_to_safest(*cell_center(goal))
         return
-    follow_legs(path_to_legs(result[1]))
+    follow_legs(path_to_legs(result[1]), blocked)
 
 
 def leave_origin(goal, blocked):
@@ -900,20 +1162,25 @@ def leave_origin(goal, blocked):
     go_to_cell(goal, blocked)
 
 
-def return_to_origin(blocked):
+def return_to_origin(blocked, fallback_blocked=None):
+    """Plan home around `blocked`; if that fails, try `fallback_blocked`."""
     print("\n--> Returning to the origin")
     start = current_cell()
     heading = motion_state()[2]
-    options = []
-    for c in origin_cells():
-        if not in_bounds(c) or c in blocked:
+    for avoid in (blocked, fallback_blocked):
+        if avoid is None:
             continue
-        result = plan_route(start, heading, c, blocked)
-        if result is not None:
-            options.append((result[0], c, result[1]))
-    if options:
-        _, _, states = min(options, key=lambda o: o[0])
-        follow_legs(path_to_legs(states))
+        options = []
+        for c in origin_cells():
+            if not in_bounds(c) or c in avoid:
+                continue
+            result = plan_route(start, heading, c, avoid)
+            if result is not None:
+                options.append((result[0], c, result[1]))
+        if options:
+            _, _, states = min(options, key=lambda o: o[0])
+            follow_legs(path_to_legs(states), avoid)
+            break
     travel_to_safest(START_X, START_Y)
     px, py = motion_state()[:2]
     print(">>> At origin: (%.2f, %.2f) cm, error %.2f cm"
@@ -1022,9 +1289,11 @@ def phase1(coords):
     street, turns, readings = [], [], {}
     exit_cell = None
     complete = False
+    dead_end = unturn = False
     cell, heading = entry_cell, entry_heading
     just_turned_in = None
     overshoot = max(0.0, 0.5 * TILE - TOUCH_REACH_CM) + TOUCH_MARGIN_CM
+    setback = turn_setback()
 
     while len(street) < MAX_STREET_CELLS:
         if time.monotonic() - t0 > PHASE1_STOP_MAPPING_AT_S:
@@ -1038,16 +1307,22 @@ def phase1(coords):
 
         tx, ty = cell_center(nxt)
         hx, hy = DIRS[heading]
-        result = drive_to(tx + hx * overshoot, ty + hy * overshoot, heading,
+        # Next to the table edge, stop short so the front ball stays on the table.
+        reach = overshoot if in_bounds(step(nxt, heading)) else -end_setback()
+        result = drive_to(tx + hx * reach, ty + hy * reach, heading,
                           stop_check=touch_pressed, wall_follow=True)
 
         if result == "stopped":
             here = wall_cell_from_touch(heading, nxt)
             if here == just_turned_in:
                 print("--> Dead end at %s" % (here,))
-                complete = True
+                complete = dead_end = unturn = True
                 break
-            settle_on_target(*cell_center(here), heading)
+            # Back off to the turning spot (wheels at the back: the front
+            # swings wide, so the axle turns behind the square's centre).
+            hx, hy = DIRS[heading]
+            cx, cy = cell_center(here)
+            settle_on_target(cx - hx * setback, cy - hy * setback, heading)
             wall, dist = right_wall(here, heading)
             readings[str(here)] = dist
             if here not in street:
@@ -1055,8 +1330,17 @@ def phase1(coords):
             new_heading = (heading + 270) % 360 if wall else (heading + 90) % 360
             print(">>> Wall ahead in %s, right %s (%.0f cm): turning %s"
                   % (here, "wall" if wall else "open", dist, "LEFT" if wall else "RIGHT"))
+            if wall:
+                # Turning left into a dead end jams the front against the left
+                # wall: if the turn stops rotating, it's a dead end.
+                if not turn_by(minimal_turn(new_heading), abort_if_stuck=True):
+                    print("--> Dead end at %s (blocked on the left too)" % (here,))
+                    turn_to_heading(heading)
+                    complete = dead_end = True
+                    break
+            else:
+                turn_to_heading(new_heading)
             turns.append([list(here), heading, new_heading])
-            turn_to_heading(new_heading)
             cell, heading, just_turned_in = here, new_heading, here
             continue
 
@@ -1088,7 +1372,18 @@ def phase1(coords):
     print_map(set(street), walls, entry_cell, exit_cell, drop_cell)
     save_map(street_map)
 
-    return_to_origin(walls)      # touching walls is allowed in Phase 1
+    if exit_cell is None and street:
+        # Still inside the street, where the robot can't turn around: back out.
+        if unturn:
+            # It turned left and then touched a wall: go back to where it
+            # turned and face the way it came in before reversing out.
+            here, before, after = turns[-1]
+            hx, hy = DIRS[before]
+            cx, cy = cell_center(tuple(here))
+            reverse_to(cx - hx * setback, cy - hy * setback, after)
+            turn_to_heading(before)
+        reverse_out([entry_cell] + street, walls)
+    return_to_origin(walls | set(street), walls)
     print("Phase 1 time: %.1f s" % (time.monotonic() - t0))
     return street_map
 
@@ -1126,30 +1421,48 @@ def street_pass(street_map, walls):
         if cell in street:
             right_wall(cell, h)          # sideways correction off the right wall
 
-    follow_legs(cells_to_legs(route), at_stop=at_stop)
+    follow_legs(cells_to_legs(route), walls, at_stop=at_stop,
+                turn_after=exit_cell is not None)
+    if exit_cell is None and street:
+        reverse_out(route, walls)        # dead end: back out the way it came
     if PADDLE_OFF_AFTER_STREET:
         paddle_off()
 
 
-def deposit(drop_cell, bucket_heading, walls):
+def deposit(drop_cell, bucket_heading, blocked):
+    """
+    Stop one square in from the drop-off facing the bucket, turn around so the
+    gate faces it, then reverse until the back of the robot is at the edge.
+    Driving in nose-first would put the front ball over the edge.
+    """
     inward = (bucket_heading + 180) % 360
     approach = step(drop_cell, inward)
+    stand = approach if in_bounds(approach) and approach not in blocked else drop_cell
     print("\n--> Heading to the drop-off %s" % (drop_cell,))
-    if current_cell() != drop_cell:
-        go_to_cell(approach, walls)
-        turn_to_heading(bucket_heading)
-        drive_leg(*cell_center(drop_cell), bucket_heading)
+    go_to_cell(stand, blocked)
+    bx, by = DIRS[bucket_heading]
+    # If there's a wall on the inward side, turn a little nearer the bucket so
+    # the front doesn't hit it when the robot ends up facing it.
+    off = 0.0 if side_free(stand, inward, blocked) else turn_setback()
+    sx, sy = cell_center(stand)
+    pivot = (sx + bx * off, sy + by * off)
+    if off > 0:
+        turn_safely(bucket_heading, blocked)
+        drive_leg(pivot[0], pivot[1], bucket_heading)   # squares on the grid line on the way
 
-    print("--> At the drop-off: turning 180 so the gate faces the bucket")
-    turn_to_heading(inward)
-    back_up(DROP_BACKUP_CM)
+    print("--> At the drop-off: turning so the gate faces the bucket")
+    turn_safely(inward, blocked)          # a 180 when it arrives facing the bucket
+    cx, cy = cell_center(drop_cell)
+    to_axle = 0.5 * TILE - AXLE_TO_REAR_CM - DROP_EDGE_GAP_CM
+    reverse_to(cx + bx * to_axle, cy + by * to_axle, inward)
+
     open_gate()
     for _ in range(WIGGLE_COUNT):
-        move_straight(WIGGLE_CM)
+        move_straight(WIGGLE_CM)          # forward first, so it never backs past the edge
         move_straight(-WIGGLE_CM)
     time.sleep(GATE_OPEN_WAIT_S)
     close_gate()
-    settle_on_target(*cell_center(drop_cell), inward)
+    drive_leg(pivot[0], pivot[1], inward)
     print(">>> Snow deposited")
 
 
@@ -1160,9 +1473,7 @@ def phase2(street_map, coords):
     street = {tuple(c) for c in street_map["street"]}
     walls = {tuple(c) for c in street_map["walls"]}
     drop_cell, bucket_heading = drop_off_cell(d1, d2)
-    # With an exit, stay out of the street after cleaning it. With a dead end
-    # the robot finishes inside the street, so the street must stay passable.
-    avoid = walls | street if street_map["exit_cell"] else walls
+    avoid = walls | street               # stay out of the street once it's clean
 
     try:
         passes = 0
@@ -1174,7 +1485,7 @@ def phase2(street_map, coords):
             time_left = PHASE_TIME_LIMIT_S - (time.monotonic() - t0)
             if passes >= PHASE2_MAX_PASSES or time_left < SECOND_PASS_MIN_TIME_LEFT_S:
                 break
-        return_to_origin(walls | street)
+        return_to_origin(avoid, walls)
     finally:
         paddle_off()
     print("Phase 2 time: %.1f s" % (time.monotonic() - t0))
@@ -1291,8 +1602,16 @@ def calibrate_turn_routine():
 def calibrate_straight_routine():
     distance = CALIBRATE_DISTANCE_TILES * TILE
     drive_to(START_X, START_Y + distance, 0.0, light_correction=False)
+    time.sleep(0.3)
     px, py = motion_state()[:2]
-    print("Odometer forward: %.2f cm (sideways: %+.2f cm)" % (py - START_Y, px - START_X))
+    odo = py - START_Y
+    print("Odometer forward: %.2f cm (sideways: %+.2f cm)" % (odo, px - START_X))
+    answer = input("Measure how far the axle really moved (cm) and type it, or Enter to skip: ")
+    try:
+        actual = float(answer)
+        print("Set WHEEL_RADIUS = %.4f" % (WHEEL_RADIUS * actual / odo))
+    except ValueError:
+        pass
 
 
 # ===========================================================================
@@ -1306,6 +1625,8 @@ if __name__ == "__main__":
             coords = get_coordinates()
             drop_off_cell(coords[2], coords[3])      # check the input early
             street_entrance(coords[0], coords[1])
+        if RUN_MODE in ("full", "phase1", "phase2"):
+            geometry_report()
 
         init_odometer()
         read_light(left_light)
