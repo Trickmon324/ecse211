@@ -55,13 +55,13 @@ LEFT_LIGHT_PORT = 4
 # ---------------------------------------------------------------------------
 WHEEL_RADIUS = 2.1          # TODO cm (RUN_MODE = "calibrate_straight" suggests a value)
 RIGHT_WHEEL_SCALE = 1.0
-TRACK_WIDTH = 15          # TODO cm between the centres of the two drive wheels
+TRACK_WIDTH = 13.5          # TODO cm between the centres of the two drive wheels
 RIGHT_TURN_FACTOR = 1.0     # TODO from RUN_MODE = "calibrate_turn"
 LEFT_TURN_FACTOR = 1.0      # TODO from RUN_MODE = "calibrate_turn"
-SENSOR_OFFSET = 4.0        # TODO cm the light sensors sit ahead of the axle
+SENSOR_OFFSET = 12.0        # TODO cm the light sensors sit ahead of the axle
 SENSOR_SEPARATION = 6.3     # TODO cm between the two light sensors
 
-AXLE_TO_FRONT_CM = 11.0     # TODO axle to the frontmost point (funnel tips, paddle, ball)
+AXLE_TO_FRONT_CM = 17.0     # TODO axle to the frontmost point (funnel tips, paddle, ball)
 AXLE_TO_REAR_CM = 5.0       # TODO axle to the back of the container (the gate)
 BODY_HALF_WIDTH_CM = 8.75   # half the body width (robot is 17.5 cm wide)
 FRONT_HALF_WIDTH_CM = 8.75  # TODO half the width across the funnel tips
@@ -473,6 +473,12 @@ def geometry_report():
         print("WARNING: the robot is too long for clean corner turns in a 30.48 cm street.")
         print("         Need corner reach + front half-width below %.1f cm (now %.1f)."
               % (TILE - 1.0, corner_reach() + max(FRONT_HALF_WIDTH_CM, BODY_HALF_WIDTH_CM)))
+    best_rod = TILE / 2 + s
+    print("Touch rod: %.1f cm from the axle; ideal is about %.1f cm (where the robot turns)"
+          % (TOUCH_REACH_CM, best_rod))
+    if TOUCH_REACH_CM > best_rod + 1.5:
+        print("WARNING: the touch rod is longer than needed: the robot stops too far from the"
+              " wall to turn cleanly and will scrape the side wall after Phase 1 corners.")
     if TOUCH_REACH_CM < AXLE_TO_FRONT_CM + 0.5:
         print("WARNING: the touch rod (%.1f cm) doesn't reach past the front (%.1f cm):"
               " the body will hit walls before the rod does." % (TOUCH_REACH_CM, AXLE_TO_FRONT_CM))
@@ -693,11 +699,15 @@ def settle_on_target(target_x, target_y, heading):
         if abs(along) <= POSITION_TOLERANCE_CM:
             return
         direction = 1 if along > 0 else -1
+        if direction > 0 and touch_pressed():
+            return                       # never creep forward into a wall
         started = time.monotonic()
         stall = StallBoost()
         try:
-            while time.monotonic() - started < 3.0:
+            while time.monotonic() - started < 1.5:
                 if leg_errors(target_x, target_y, heading)[0] * direction <= 0:
+                    break
+                if direction > 0 and touch_pressed():
                     break
                 p = direction * (CREEP_POWER + stall.update())
                 set_powers(p, p)
@@ -1320,9 +1330,13 @@ def phase1(coords):
                 break
             # Back off to the turning spot (wheels at the back: the front
             # swings wide, so the axle turns behind the square's centre).
+            # Only ever back up here: if the rod is long enough that the
+            # robot is already behind that spot, it turns where it is.
             hx, hy = DIRS[heading]
             cx, cy = cell_center(here)
-            settle_on_target(cx - hx * setback, cy - hy * setback, heading)
+            tx, ty = cx - hx * setback, cy - hy * setback
+            if leg_errors(tx, ty, heading)[0] < -POSITION_TOLERANCE_CM:
+                settle_on_target(tx, ty, heading)
             wall, dist = right_wall(here, heading)
             readings[str(here)] = dist
             if here not in street:
