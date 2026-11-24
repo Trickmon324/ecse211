@@ -1,0 +1,1685 @@
+import heapq
+import json
+import math
+import statistics
+import time
+from collections import deque
+from threading import Event, Lock, Thread
+
+from utils.brick import (
+    EV3ColorSensor,
+    EV3UltrasonicSensor,
+    Motor,
+    TouchSensor,
+    reset_brick,
+    wait_ready_sensors,
+)
+
+# ==============================================================================
+# 1. MODE & HARDWARE CONFIGURATION
+# ==============================================================================
+# Modes:
+#   "map"                      -> Phase 1 mapping + Mode 1 (Drop-off) or Mode 2 (Double-pass)
+#   "test_sensors"             -> Stationary live print of Distance / Light / Bumper
+#   "calibrate_turn"           -> Tune TURN_FACTOR
+#   "calibrate_straight"       -> Tune RIGHT_WHEEL_SCALE
+#   "calibrate_light_squaring" -> Test single line square + cross-track recovery
+RUN_MODE = "map"
+
+# Default post-mapping behavior after exiting the street:
+#   1 -> Test run: navigate safely to (d1, d2), park back at drop-off, and stop
+#   2 -> Double pass: re-enter street to verify mapping accuracy, then return to (0, 0)
+DEFAULT_POST_MAPPING_MODE = 1
+
+# Orientation of the 90-deg sideways ultrasonic sensor ("right" or "left")
+SIDE_SENSOR_ORIENTATION = "right"
+
+# Initial compass heading when placed on (0, 0):
+#   0.0 = +Y (North/Up), 90.0 = +X (East/Right)
+START_HEADING_DEG = 0.0
+
+LEFT_MOTOR_PORT = "C"
+RIGHT_MOTOR_PORT = "B"
+LEFT_LIGHT_PORT = 4
+TOUCH_PORT = 2
+US_PORT = 3
+RIGHT_LIGHT_PORT = 1
+
+# ==============================================================================
+# 2. PHYSICAL GEOMETRY & ARENA BOUNDS (cm / grid units)
+# ==============================================================================
+TILE = 30.48
+MAP_X_MIN, MAP_X_MAX = -1, 8   # Tile x indices: -1..7 (9 columns)
+MAP_Y_MIN, MAP_Y_MAX = -1, 4   # Tile y indices: -1..3 (5 rows)
+
+WHEEL_RADIUS = 2.1
+TRACK_WIDTH = 15.0
+RIGHT_WHEEL_SCALE = 1.0
+
+SENSOR_OFFSET = 4.0            # Light sensors forward of wheel axle
+SENSOR_SEPARATION = 6.3        # Transverse distance between light sensors
+TOUCH_SENSOR_OFFSET_CM = 11.0  # Front bumper contact ahead of wheel axle
+ROBOT_LENGTH_CM = 22.0
+ROBOT_WIDTH_CM = 17.5
+
+POST_LINE_TILE_CENTER_CM = (TILE / 2.0) - SENSOR_OFFSET  # 11.24 cm
+POST_LINE_INTERSECTION_CM = SENSOR_OFFSET                # 4.00 cm
+BUMP_BACKUP_CM = 1.0
+DROP_OFF_PARK_BACKUP_CM = 4.0  # From drop-off tile center, backs rear flush to edge
+
+# ==============================================================================
+# 3. ULTRASONIC, LIGHT & MOTION CONTROL PARAMETERS
+# ==============================================================================
+LOOP_SECONDS = 0.01
+SENSOR_PRINT_INTERVAL = 0.50
+
+# Ultrasonic corridor tracking (Deadband + Quadratic Gain)
+US_BAND_CENTER = 5.0
+US_DEADBAND_CM = 0.5
+US_TOO_CLOSE = 1.8
+US_TOO_FAR = 11.5
+WALL_DETECT_THRESHOLD_CM = 14.0
+WALL_QUAD_KP = 1.4
+MAX_WALL_ANGLE_DEG = 18.0
+URGENT_WALL_ANGLE_DEG = 14.0
+US_FILTER_SAMPLES = 7
+
+# Cross-track (lateral) drift recovery after line squaring
+DRIFT_CORRECTION_SIGN = +1.0   # +1.0 matches physical LEFT=Port 4, RIGHT=Port 1
+CROSS_TRACK_KP = 2.8
+MAX_CROSS_TRACK_DEG = 15.0
+
+# Light sensors & squaring
+WHITE_LEFT = 370
+WHITE_RIGHT = 380
+LINE_DROP = 130
+LIGHT_FILTER_SAMPLES = 5
+BLIND_AFTER_LINE_CM = 12.0
+BLIND_AFTER_TURN_CM = 3.5
+PERP_LINE_TOLERANCE_CM = 7.5
+ALIGN_LEVER_RATIO = ((TRACK_WIDTH - SENSOR_SEPARATION) / 2.0) / SENSOR_SEPARATION
+ALIGN_TIMEOUT_S = 1.8
+ALIGN_MAX_PIVOT_DEG = 25.0
+APPLY_LATERAL_DRIFT = True
+MAX_LATERAL_DRIFT_CM = 3.5
+
+# Motor powers & dynamics
+DRIVE_POWER = 24
+APPROACH_POWER = 24
+ALIGN_POWER = 22
+CREEP_POWER = 20
+HEADING_KP = 0.65
+MAX_STEER_DELTA = 16.0
+
+TURN_POWER = 28
+TURN_MIN_POWER = 20
+TURN_RAMP_DEG = 10.0
+TURN_SLOW_DEG = 35.0
+TURN_TOLERANCE_DEG = 0.8
+TURN_TIMEOUT_S = 5.0
+RIGHT_TURN_FACTOR = 1.0
+LEFT_TURN_FACTOR = 1.0
+
+# Anti-stall watchdog
+STALL_CHECK_SEC = 0.35
+STALL_BOOST_STEP = 5
+MAX_BOOST_POWER = 36
+
+# Calibration defaults
+CALIB_STRAIGHT_TILES = 3
+CALIB_TURN_POWER = 25
+
+# Mapping heuristics
+DEAD_END_BUMP_DIST_CM = 15.0
+EDGE_STOP_MARGIN_CM = 0.5 * TILE  # Stop at middle of outer edge tile before falling off
+MAP_SAVE_FILE = "mapped_street.json"
+
+# ==============================================================================
+# 4. HARDWARE OBJECTS & SHARED STATE
+# ==============================================================================
+left_motor = None
+right_motor = None
+left_light = None
+right_light = None
+touch_sensor = None
+side_us = None
+
+odo_lock = Lock()
+sensor_lock = Lock()
+shutdown = Event()
+
+x_cm = 0.0
+y_cm = 0.0
+theta_deg = START_HEADING_DEG
+left_distance_cm = 0.0
+right_distance_cm = 0.0
+travel_cm = 0.0
+
+is_turning = False
+left_rgb_buf = deque(maxlen=LIGHT_FILTER_SAMPLES)
+right_rgb_buf = deque(maxlen=LIGHT_FILTER_SAMPLES)
+us_buf = deque(maxlen=US_FILTER_SAMPLES)
+
+# Map data structures
+wall_boxes = {}            # {(tx, ty): {"corners": [...], "source": str}}
+street_tiles = []          # Ordered list of traversed street tiles (tx, ty)
+protected_open_tiles = set()
+
+
+# ==============================================================================
+# 5. MATH & HARDWARE HELPERS
+# ==============================================================================
+def wrap180(angle_deg):
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+def clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+
+def snap_cardinal(angle_deg):
+    return round(angle_deg / 90.0) * 90.0 % 360.0
+
+
+def heading_unit_vec(heading_deg):
+    rad = math.radians(heading_deg)
+    return math.sin(rad), math.cos(rad)
+
+
+def right_unit_vec(heading_deg):
+    ux, uy = heading_unit_vec(heading_deg)
+    return uy, -ux
+
+
+def coord_to_tile(px_cm, py_cm):
+    return int(math.floor(px_cm / TILE)), int(math.floor(py_cm / TILE))
+
+
+def tile_in_bounds(tx, ty):
+    return MAP_X_MIN <= tx < MAP_X_MAX and MAP_Y_MIN <= ty < MAP_Y_MAX
+
+
+def clamp_tile_in_bounds(tx, ty):
+    return int(clamp(tx, MAP_X_MIN, MAP_X_MAX - 1)), int(clamp(ty, MAP_Y_MIN, MAP_Y_MAX - 1))
+
+
+def tile_corners(tx, ty):
+    return [(tx, ty), (tx, ty + 1), (tx + 1, ty + 1), (tx + 1, ty)]
+
+
+def read_encoder_deg(motor):
+    try:
+        if hasattr(motor, "get_position"):
+            val = motor.get_position()
+        elif hasattr(motor, "get_encoder"):
+            val = motor.get_encoder()
+        else:
+            raise AttributeError("Motor has neither get_position nor get_encoder")
+        return None if val is None else float(val)
+    except Exception:
+        return None
+
+
+def zero_encoder(motor):
+    if hasattr(motor, "reset_encoder"):
+        motor.reset_encoder()
+
+
+def set_drive_powers(left_pwr, right_pwr):
+    left_motor.set_power(int(round(clamp(left_pwr, -100, 100))))
+    right_motor.set_power(int(round(clamp(right_pwr, -100, 100))))
+
+
+def stop_motors():
+    if left_motor is not None:
+        left_motor.set_power(0)
+    if right_motor is not None:
+        right_motor.set_power(0)
+
+
+def is_bumper_pressed():
+    try:
+        if hasattr(touch_sensor, "get_value"):
+            val = touch_sensor.get_value()
+        elif hasattr(touch_sensor, "is_pressed"):
+            val = touch_sensor.is_pressed()
+        else:
+            val = 0
+        return val == 1 or val is True
+    except Exception:
+        return False
+
+
+def read_light_sum(sensor):
+    try:
+        rgb = sensor.get_rgb()
+        if rgb is not None and len(rgb) >= 3 and all(v is not None for v in rgb[:3]):
+            return float(rgb[0] + rgb[1] + rgb[2])
+    except Exception:
+        pass
+    return None
+
+
+def read_raw_us_cm():
+    try:
+        d = side_us.get_cm()
+        if d is not None and 0.0 < d <= 255.0:
+            return float(d)
+    except Exception:
+        pass
+    return None
+
+
+def get_pose():
+    with odo_lock:
+        return x_cm, y_cm, theta_deg, travel_cm
+
+
+def set_pose(new_x, new_y, new_theta):
+    global x_cm, y_cm, theta_deg
+    with odo_lock:
+        x_cm = float(new_x)
+        y_cm = float(new_y)
+        theta_deg = float(new_theta) % 360.0
+
+
+def get_light_medians():
+    with sensor_lock:
+        med_l = statistics.median(left_rgb_buf) if left_rgb_buf else None
+        med_r = statistics.median(right_rgb_buf) if right_rgb_buf else None
+    return med_l, med_r
+
+
+def is_left_on_line(med_l):
+    return med_l is not None and med_l < (WHITE_LEFT - LINE_DROP)
+
+
+def is_right_on_line(med_r):
+    return med_r is not None and med_r < (WHITE_RIGHT - LINE_DROP)
+
+
+def get_filtered_us_cm():
+    with sensor_lock:
+        if not us_buf:
+            return None
+        return statistics.median(us_buf)
+
+
+def format_sensor_line():
+    us_val = get_filtered_us_cm()
+    med_l, med_r = get_light_medians()
+    us_str = f"{us_val:.1f} cm" if us_val is not None else "None"
+    r_str = f"{med_r:.0f}" if med_r is not None else "None"
+    l_str = f"{med_l:.0f}" if med_l is not None else "None"
+    return f"Distance sensor: {us_str} ; Right Light sensor: {r_str} ; Left light sensor: {l_str}"
+
+
+def sample_fresh_side_us(num_samples=US_FILTER_SAMPLES):
+    with sensor_lock:
+        us_buf.clear()
+    samples = []
+    deadline = time.monotonic() + 0.25
+    while len(samples) < num_samples and time.monotonic() < deadline:
+        val = read_raw_us_cm()
+        if val is not None:
+            samples.append(val)
+            with sensor_lock:
+                us_buf.append(val)
+        time.sleep(0.015)
+    if not samples:
+        return None
+    return statistics.median(samples)
+
+
+def sample_side_us_duration(duration_s=0.5):
+    """Collect side US readings continuously for duration_s while stationary."""
+    with sensor_lock:
+        us_buf.clear()
+    samples = []
+    deadline = time.monotonic() + duration_s
+    while time.monotonic() < deadline and not shutdown.is_set():
+        val = read_raw_us_cm()
+        if val is not None:
+            samples.append(val)
+            with sensor_lock:
+                us_buf.append(val)
+        time.sleep(0.02)
+    if not samples:
+        return None
+    return statistics.median(samples)
+
+
+def compute_wall_angle_offset(side_dist, side_mult):
+    err_us = side_dist - US_BAND_CENTER
+    if abs(err_us) <= US_DEADBAND_CM:
+        return 0.0
+
+    eff_err = err_us - math.copysign(US_DEADBAND_CM, err_us)
+    angle = side_mult * WALL_QUAD_KP * (eff_err * abs(eff_err))
+
+    if side_dist <= US_TOO_CLOSE and abs(angle) < URGENT_WALL_ANGLE_DEG:
+        angle = -side_mult * URGENT_WALL_ANGLE_DEG
+
+    return clamp(angle, -MAX_WALL_ANGLE_DEG, MAX_WALL_ANGLE_DEG)
+
+
+# ==============================================================================
+# 6. BACKGROUND ODOMETRY & SENSOR THREAD
+# ==============================================================================
+def odometer_thread_loop():
+    global x_cm, y_cm, theta_deg, left_distance_cm, right_distance_cm, travel_cm
+
+    last_l = read_encoder_deg(left_motor) or 0.0
+    last_r = read_encoder_deg(right_motor) or 0.0
+
+    while not shutdown.is_set():
+        t_start = time.monotonic()
+
+        cur_l = read_encoder_deg(left_motor)
+        cur_r = read_encoder_deg(right_motor)
+        if cur_l is not None and cur_r is not None:
+            dl = math.radians(cur_l - last_l) * WHEEL_RADIUS
+            dr = math.radians(cur_r - last_r) * WHEEL_RADIUS * RIGHT_WHEEL_SCALE
+            last_l = cur_l
+            last_r = cur_r
+
+            ds = (dl + dr) / 2.0
+            dtheta_raw = math.degrees((dl - dr) / TRACK_WIDTH)
+            factor = RIGHT_TURN_FACTOR if dtheta_raw >= 0.0 else LEFT_TURN_FACTOR
+            dtheta = dtheta_raw / factor
+
+            with odo_lock:
+                theta_mid = math.radians(theta_deg + dtheta / 2.0)
+                x_cm += ds * math.sin(theta_mid)
+                y_cm += ds * math.cos(theta_mid)
+                theta_deg = (theta_deg + dtheta) % 360.0
+                left_distance_cm += dl
+                right_distance_cm += dr
+                travel_cm += ds
+
+        rgb_l = read_light_sum(left_light)
+        rgb_r = read_light_sum(right_light)
+        with sensor_lock:
+            turning_now = is_turning
+            if rgb_l is not None:
+                left_rgb_buf.append(rgb_l)
+            if rgb_r is not None:
+                right_rgb_buf.append(rgb_r)
+
+        if not turning_now:
+            us_val = read_raw_us_cm()
+            if us_val is not None:
+                with sensor_lock:
+                    if not is_turning:
+                        us_buf.append(us_val)
+
+        elapsed = time.monotonic() - t_start
+        sleep_time = LOOP_SECONDS - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+def wait_for_initial_sensors():
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        med_l, med_r = get_light_medians()
+        if med_l is not None and med_r is not None:
+            break
+        time.sleep(0.02)
+
+
+# ==============================================================================
+# 7. PRIMITIVE MOTION & LINE SQUARING
+# ==============================================================================
+def turn_by_angle(delta_deg, base_power=TURN_POWER):
+    global is_turning
+
+    if abs(delta_deg) < TURN_TOLERANCE_DEG:
+        return
+
+    print(f"[TURN] Turning by {delta_deg:+.1f} deg...")
+    with sensor_lock:
+        is_turning = True
+
+    try:
+        _, _, start_theta, _ = get_pose()
+        accumulated = 0.0
+        prev_theta = start_theta
+        t0 = time.monotonic()
+
+        last_progress_t = t0
+        last_progress_acc = 0.0
+        stall_boost = 0.0
+
+        while not shutdown.is_set():
+            _, _, cur_theta, _ = get_pose()
+            step = wrap180(cur_theta - prev_theta)
+            accumulated += step
+            prev_theta = cur_theta
+
+            remaining = delta_deg - accumulated
+            if abs(remaining) <= TURN_TOLERANCE_DEG:
+                break
+            if time.monotonic() - t0 > TURN_TIMEOUT_S:
+                print(f"[WARN] Turn timeout (remaining={remaining:.2f} deg)")
+                break
+
+            now = time.monotonic()
+            if abs(accumulated - last_progress_acc) > 0.4:
+                last_progress_acc = accumulated
+                last_progress_t = now
+                stall_boost = 0.0
+            elif now - last_progress_t >= STALL_CHECK_SEC:
+                stall_boost = min(stall_boost + STALL_BOOST_STEP, MAX_BOOST_POWER - TURN_MIN_POWER)
+                last_progress_t = now
+
+            done = abs(accumulated)
+            rem = abs(remaining)
+            ramp_up = clamp(done / TURN_RAMP_DEG, 0.0, 1.0)
+            ramp_down = clamp(rem / TURN_SLOW_DEG, 0.0, 1.0)
+            scale = min(ramp_up, ramp_down)
+            pwr = clamp(TURN_MIN_POWER + scale * (base_power - TURN_MIN_POWER) + stall_boost, 0, MAX_BOOST_POWER)
+
+            if remaining > 0:
+                set_drive_powers(pwr, -pwr)
+            else:
+                set_drive_powers(-pwr, pwr)
+
+            time.sleep(LOOP_SECONDS)
+
+        stop_motors()
+        time.sleep(0.08)
+    finally:
+        with sensor_lock:
+            us_buf.clear()
+            is_turning = False
+
+
+def turn_to_heading(target_heading_deg, base_power=TURN_POWER):
+    _, _, cur_theta, _ = get_pose()
+    delta = wrap180(target_heading_deg - cur_theta)
+    turn_by_angle(delta, base_power=base_power)
+
+
+def back_up(dist_cm, heading_hold_deg=None, power=CREEP_POWER):
+    if dist_cm <= 0:
+        return
+    print(f"[MOVE] Backing up {dist_cm:.1f} cm...")
+    _, _, cur_theta, start_travel = get_pose()
+    target_h = cur_theta if heading_hold_deg is None else heading_hold_deg
+
+    t0 = time.monotonic()
+    last_prog_t = t0
+    last_backed = 0.0
+    boost = 0.0
+
+    while not shutdown.is_set():
+        _, _, theta_now, trav = get_pose()
+        backed = start_travel - trav
+        if backed >= dist_cm or (time.monotonic() - t0) > 4.0:
+            break
+
+        now = time.monotonic()
+        if backed - last_backed > 0.15:
+            last_backed = backed
+            last_prog_t = now
+            boost = 0.0
+        elif now - last_prog_t >= STALL_CHECK_SEC:
+            boost = min(boost + STALL_BOOST_STEP, MAX_BOOST_POWER - power)
+            last_prog_t = now
+
+        err = wrap180(target_h - theta_now)
+        corr = clamp(HEADING_KP * err, -MAX_STEER_DELTA, MAX_STEER_DELTA)
+        p = power + boost
+        set_drive_powers(-p + corr, -p - corr)
+        time.sleep(LOOP_SECONDS)
+
+    stop_motors()
+    time.sleep(0.05)
+
+
+def creep_forward(dist_cm, target_heading_deg, power=CREEP_POWER, stop_on_bump=False):
+    if dist_cm <= 0:
+        return False
+    _, _, _, start_travel = get_pose()
+    t0 = time.monotonic()
+    while not shutdown.is_set():
+        if stop_on_bump and is_bumper_pressed():
+            stop_motors()
+            return True
+        _, _, cur_theta, trav = get_pose()
+        if (trav - start_travel) >= dist_cm or (time.monotonic() - t0) > 5.0:
+            break
+        err = wrap180(target_heading_deg - cur_theta)
+        corr = clamp(HEADING_KP * err, -MAX_STEER_DELTA, MAX_STEER_DELTA)
+        set_drive_powers(power + corr, power - corr)
+        time.sleep(LOOP_SECONDS)
+
+    stop_motors()
+    time.sleep(0.04)
+    return False
+
+
+def square_on_line(cardinal_heading, leg_length_cm, avg_leg_heading_deg, verbose=True):
+    _, _, theta_start, _ = get_pose()
+    med_l, med_r = get_light_medians()
+    left_hit = is_left_on_line(med_l)
+    right_hit = is_right_on_line(med_r)
+
+    if not left_hit and not right_hit:
+        return False, None
+
+    t0 = time.monotonic()
+    last_prog_t = t0
+    last_theta = theta_start
+    boost = 0.0
+    bumped = False
+
+    while not (left_hit and right_hit) and not shutdown.is_set():
+        if is_bumper_pressed():
+            bumped = True
+            break
+        now = time.monotonic()
+        if now - t0 > ALIGN_TIMEOUT_S:
+            break
+        _, _, cur_theta, _ = get_pose()
+        if abs(wrap180(cur_theta - theta_start)) > ALIGN_MAX_PIVOT_DEG:
+            break
+
+        if abs(wrap180(cur_theta - last_theta)) > 0.3:
+            last_theta = cur_theta
+            last_prog_t = now
+            boost = 0.0
+        elif now - last_prog_t >= STALL_CHECK_SEC:
+            boost = min(boost + STALL_BOOST_STEP, MAX_BOOST_POWER - ALIGN_POWER)
+            last_prog_t = now
+
+        med_l, med_r = get_light_medians()
+        if not left_hit and is_left_on_line(med_l):
+            left_hit = True
+        if not right_hit and is_right_on_line(med_r):
+            right_hit = True
+
+        if left_hit and right_hit:
+            break
+
+        pwr = ALIGN_POWER + boost
+        pwr_l = 0 if left_hit else pwr
+        pwr_r = 0 if right_hit else pwr
+        set_drive_powers(pwr_l, pwr_r)
+        time.sleep(LOOP_SECONDS)
+
+    stop_motors()
+    time.sleep(0.05)
+
+    if bumped or not (left_hit and right_hit):
+        if verbose:
+            print(f"[ALIGN] Skipped snap (L={left_hit}, R={right_hit}, bump={bumped}).")
+        return False, None
+
+    cur_x, cur_y, theta_end, _ = get_pose()
+    ux, uy = heading_unit_vec(cardinal_heading)
+
+    if abs(ux) > abs(uy):
+        sensor_axis = cur_x + ux * SENSOR_OFFSET
+        line_coord = round(sensor_axis / TILE) * TILE
+    else:
+        sensor_axis = cur_y + uy * SENSOR_OFFSET
+        line_coord = round(sensor_axis / TILE) * TILE
+
+    if abs(sensor_axis - line_coord) > PERP_LINE_TOLERANCE_CM:
+        if verbose:
+            print(f"[ALIGN] Rejected outlier snap: sensor={sensor_axis:.2f} vs grid={line_coord:.2f}")
+        return False, None
+
+    delta_theta_pivot = wrap180(theta_end - theta_start)
+    phi_approach_deg = -delta_theta_pivot * (1.0 + ALIGN_LEVER_RATIO)
+    odo_heading_bias_deg = wrap180(avg_leg_heading_deg - cardinal_heading)
+    unmeasured_phi_deg = phi_approach_deg - odo_heading_bias_deg
+
+    drift_lat = 0.0
+    if APPLY_LATERAL_DRIFT and leg_length_cm > 0:
+        raw_drift = DRIFT_CORRECTION_SIGN * leg_length_cm * math.sin(math.radians(unmeasured_phi_deg))
+        drift_lat = clamp(raw_drift, -MAX_LATERAL_DRIFT_CM, MAX_LATERAL_DRIFT_CM)
+
+    rx, ry = right_unit_vec(cardinal_heading)
+    if abs(ux) > abs(uy):
+        new_x = line_coord - ux * SENSOR_OFFSET
+        new_y = cur_y + drift_lat * ry
+    else:
+        new_x = cur_x + drift_lat * rx
+        new_y = line_coord - uy * SENSOR_OFFSET
+
+    set_pose(new_x, new_y, cardinal_heading)
+
+    if verbose:
+        side_word = "RIGHT" if drift_lat > 0.1 else ("LEFT" if drift_lat < -0.1 else "CENTER")
+        opp_word = "LEFT" if drift_lat > 0.1 else ("RIGHT" if drift_lat < -0.1 else "STRAIGHT")
+        print(
+            f"[ALIGN] line={line_coord:.1f}cm | pivot={delta_theta_pivot:+.2f}deg | "
+            f"drift={drift_lat:+.2f}cm ({side_word}) -> pose=({new_x:.1f}, {new_y:.1f}, {cardinal_heading:.0f}) "
+            f"| steer={opp_word}"
+        )
+
+    return True, line_coord
+
+
+# ==============================================================================
+# 8. OPEN-SPACE POINT-TO-POINT NAVIGATION (WITH CROSS-TRACK DRIFT RECOVERY)
+# ==============================================================================
+def drive_to_point_cardinal(target_x_cm, target_y_cm, cardinal_heading,
+                            use_line_squaring=True, initial_blind_cm=BLIND_AFTER_TURN_CM,
+                            power=APPROACH_POWER, stop_on_bump=True):
+    turn_to_heading(cardinal_heading)
+    ux, uy = heading_unit_vec(cardinal_heading)
+    rx, ry = right_unit_vec(cardinal_heading)
+
+    cur_x, cur_y, cur_theta, start_trav = get_pose()
+    init_dist = max(0.0, (target_x_cm - cur_x) * ux + (target_y_cm - cur_y) * uy)
+    print(f"[NAV] Driving hdg={cardinal_heading:.0f} deg dist={init_dist:.1f} cm -> ({target_x_cm:.1f}, {target_y_cm:.1f})")
+
+    last_line_trav = start_trav
+    blind_cm = initial_blind_cm
+    heading_sum = 0.0
+    heading_cnt = 0
+
+    t0 = time.monotonic()
+    max_time_s = max(8.0, (init_dist / 5.0) + 6.0)
+    last_prog_t = t0
+    last_trav = start_trav
+    boost = 0.0
+    last_dbg = t0
+
+    while not shutdown.is_set():
+        if stop_on_bump and is_bumper_pressed():
+            stop_motors()
+            return False, True
+
+        cur_x, cur_y, cur_theta, cur_trav = get_pose()
+        rem_cm = (target_x_cm - cur_x) * ux + (target_y_cm - cur_y) * uy
+        if rem_cm <= 0.5:
+            break
+
+        now = time.monotonic()
+        if now - t0 > max_time_s:
+            print(f"[WARN] drive_to_point timeout (rem={rem_cm:.1f} cm)")
+            break
+
+        if abs(cur_trav - last_trav) > 0.25:
+            last_trav = cur_trav
+            last_prog_t = now
+            boost = 0.0
+        elif now - last_prog_t >= STALL_CHECK_SEC:
+            boost = min(boost + STALL_BOOST_STEP, MAX_BOOST_POWER - CREEP_POWER)
+            last_prog_t = now
+
+        heading_sum += wrap180(cur_theta - cardinal_heading)
+        heading_cnt += 1
+
+        dist_since_line = cur_trav - last_line_trav
+        if use_line_squaring and dist_since_line >= blind_cm and rem_cm > 1.0:
+            sensor_pos = (cur_x + ux * SENSOR_OFFSET) if abs(ux) > abs(uy) else (cur_y + uy * SENSOR_OFFSET)
+            nearest_line = round(sensor_pos / TILE) * TILE
+            if abs(sensor_pos - nearest_line) <= PERP_LINE_TOLERANCE_CM:
+                med_l, med_r = get_light_medians()
+                if is_left_on_line(med_l) or is_right_on_line(med_r):
+                    avg_h = cardinal_heading + (heading_sum / max(1, heading_cnt))
+                    ok, _ = square_on_line(cardinal_heading, dist_since_line, avg_h)
+                    _, _, _, post_trav = get_pose()
+                    last_line_trav = post_trav
+                    blind_cm = BLIND_AFTER_LINE_CM if ok else 7.0
+                    heading_sum = 0.0
+                    heading_cnt = 0
+                    last_trav = post_trav
+                    last_prog_t = time.monotonic()
+                    boost = 0.0
+                    continue
+
+        lat_err_cm = (target_x_cm - cur_x) * rx + (target_y_cm - cur_y) * ry
+        lat_angle_offset = 0.0
+        if rem_cm > 8.0:
+            lat_angle_offset = clamp(CROSS_TRACK_KP * lat_err_cm, -MAX_CROSS_TRACK_DEG, MAX_CROSS_TRACK_DEG)
+
+        desired_heading = cardinal_heading + lat_angle_offset
+        err = wrap180(desired_heading - cur_theta)
+        corr = clamp(HEADING_KP * err, -MAX_STEER_DELTA, MAX_STEER_DELTA)
+
+        base_p = CREEP_POWER if rem_cm < 6.0 else power
+        drive_pwr = clamp(base_p + boost, 0, MAX_BOOST_POWER)
+        set_drive_powers(drive_pwr + corr, drive_pwr - corr)
+
+        if now - last_dbg >= SENSOR_PRINT_INTERVAL:
+            print(
+                f"{format_sensor_line()} | pos=({cur_x:.1f},{cur_y:.1f}) "
+                f"th={cur_theta:.1f}->{desired_heading:.1f} rem={rem_cm:.1f}"
+            )
+            last_dbg = now
+
+        time.sleep(LOOP_SECONDS)
+
+    stop_motors()
+    time.sleep(0.05)
+    return True, False
+
+
+# ==============================================================================
+# 9. ENTRANCE & DROP-OFF GEOMETRY + SAFE APPROACH / PATH PLANNING
+# ==============================================================================
+def parse_coord_pair(prompt_text):
+    while True:
+        raw = input(prompt_text).strip().replace("(", "").replace(")", "").replace(",", " ")
+        parts = raw.split()
+        if len(parts) == 2:
+            try:
+                gx, gy = int(parts[0]), int(parts[1])
+                if MAP_X_MIN <= gx <= MAP_X_MAX and MAP_Y_MIN <= gy <= MAP_Y_MAX:
+                    return (gx, gy)
+                print(f"Coordinates out of arena bounds [{MAP_X_MIN},{MAP_X_MAX}] x [{MAP_Y_MIN},{MAP_Y_MAX}].")
+                continue
+            except ValueError:
+                pass
+        print("Invalid input. Enter two integers like: 1 3")
+
+
+def vec_to_heading(ux, uy):
+    if ux == 0 and uy == 1:
+        return 0.0
+    if ux == 1 and uy == 0:
+        return 90.0
+    if ux == 0 and uy == -1:
+        return 180.0
+    return 270.0
+
+
+def compute_gate_plan(s1, s2):
+    """
+    Per PDF spec: when facing the street, s1 is on the LEFT and s2 is on the RIGHT.
+    Therefore entry_vec = (-(s2_y - s1_y), (s2_x - s1_x)).
+    """
+    x1, y1 = s1
+    x2, y2 = s2
+    dx, dy = x2 - x1, y2 - y1
+    if abs(dx) + abs(dy) != 1:
+        raise ValueError(f"Invalid street entrance s1={s1}, s2={s2}: must be 1 grid unit apart.")
+
+    entry_ux, entry_uy = -dy, dx
+    entry_heading = vec_to_heading(entry_ux, entry_uy)
+    exit_heading = (entry_heading + 180.0) % 360.0
+
+    mx = (x1 + x2) / 2.0
+    my = (y1 + y2) / 2.0
+
+    if abs(entry_ux) == 1:
+        gate_axis = "vertical"
+        x_gate = float(x1)
+        gate_line_cm = x_gate * TILE
+        gate_center_perp_cm = my * TILE
+
+        # Pick safe staging x outside the gate wall
+        if entry_ux > 0 and x_gate == 1.0:
+            x_stage = 0.0
+        elif entry_ux > 0 and x_gate == 0.0:
+            x_stage = -0.5
+        else:
+            x_stage = x_gate - 0.5 * entry_ux
+
+        waypoints = []
+        if entry_ux < 0 and x_gate > 0:
+            # Gate faces -X (toward origin): step to y=-0.5 to get past street first, then x_stage
+            waypoints.append((0.0, -0.5 * TILE, 180.0))
+            waypoints.append((x_stage * TILE, -0.5 * TILE, 90.0))
+            y_dir = 0.0 if my >= -0.5 else 180.0
+            waypoints.append((x_stage * TILE, my * TILE, y_dir))
+        else:
+            if abs(x_stage - 0.0) > 1e-6:
+                waypoints.append((x_stage * TILE, 0.0, 90.0 if x_stage > 0 else 270.0))
+            y_dir = 0.0 if my >= 0.0 else 180.0
+            waypoints.append((x_stage * TILE, my * TILE, y_dir))
+
+        stage_pt = (x_stage * TILE, my * TILE)
+        stage_tile = coord_to_tile((x_gate - 0.5 * entry_ux) * TILE, my * TILE)
+        first_tile_center = ((x_gate + 0.5 * entry_ux) * TILE, my * TILE)
+    else:
+        gate_axis = "horizontal"
+        y_gate = float(y1)
+        gate_line_cm = y_gate * TILE
+        gate_center_perp_cm = mx * TILE
+
+        if entry_uy > 0 and y_gate == 1.0:
+            y_stage = 0.0
+        elif entry_uy > 0 and y_gate == 0.0:
+            y_stage = -0.5
+        else:
+            y_stage = y_gate - 0.5 * entry_uy
+
+        waypoints = []
+        if entry_uy < 0 and y_gate > 0:
+            waypoints.append((-0.5 * TILE, 0.0, 270.0))
+            waypoints.append((-0.5 * TILE, y_stage * TILE, 0.0))
+            x_dir = 90.0 if mx >= -0.5 else 270.0
+            waypoints.append((mx * TILE, y_stage * TILE, x_dir))
+        else:
+            if abs(y_stage - 0.0) > 1e-6:
+                waypoints.append((0.0, y_stage * TILE, 0.0 if y_stage > 0 else 180.0))
+            x_dir = 90.0 if mx >= 0.0 else 270.0
+            waypoints.append((mx * TILE, y_stage * TILE, x_dir))
+
+        stage_pt = (mx * TILE, y_stage * TILE)
+        stage_tile = coord_to_tile(mx * TILE, (y_gate - 0.5 * entry_uy) * TILE)
+        first_tile_center = (mx * TILE, (y_gate + 0.5 * entry_uy) * TILE)
+
+    first_tile = coord_to_tile(*first_tile_center)
+    protected_open_tiles.add(clamp_tile_in_bounds(*stage_tile))
+    protected_open_tiles.add((0, 0))
+    protected_open_tiles.add((-1, -1))
+    protected_open_tiles.add((-1, 0))
+    protected_open_tiles.add((0, -1))
+
+    return {
+        "gate_axis": gate_axis,
+        "s1": s1,
+        "s2": s2,
+        "waypoints_to_stage": waypoints,
+        "stage_pt": stage_pt,
+        "stage_tile": clamp_tile_in_bounds(*stage_tile),
+        "entry_heading": entry_heading,
+        "exit_heading": exit_heading,
+        "entry_vec": (entry_ux, entry_uy),
+        "gate_line_cm": gate_line_cm,
+        "gate_center_perp_cm": gate_center_perp_cm,
+        "first_tile_center": first_tile_center,
+        "first_tile": first_tile,
+    }
+
+
+def compute_dropoff_plan(d1, d2):
+    """
+    Determine inside drop-off tile and the heading that parks the robot's BACK
+    at the (d1, d2) bucket edge.
+    """
+    x1, y1 = d1
+    x2, y2 = d2
+    if abs(x2 - x1) + abs(y2 - y1) != 1:
+        raise ValueError(f"Invalid drop-off d1={d1}, d2={d2}: must be 1 grid unit apart.")
+
+    if y1 == y2 == MAP_Y_MIN:
+        # Bottom edge -> bucket is -Y -> face +Y (0 deg) so BACK faces bucket
+        return (min(x1, x2), MAP_Y_MIN), 0.0
+    if y1 == y2 == MAP_Y_MAX:
+        # Top edge -> bucket is +Y -> face -Y (180 deg)
+        return (min(x1, x2), MAP_Y_MAX - 1), 180.0
+    if x1 == x2 == MAP_X_MIN:
+        # Left edge -> bucket is -X -> face +X (90 deg)
+        return (MAP_X_MIN, min(y1, y2)), 90.0
+    if x1 == x2 == MAP_X_MAX:
+        # Right edge -> bucket is +X -> face -X (270 deg)
+        return (MAP_X_MAX - 1, min(y1, y2)), 270.0
+
+    raise ValueError(f"Drop-off d1={d1}, d2={d2} must lie on outer edge of map [-1,8] x [-1,4].")
+
+
+def navigate_origin_to_entrance(plan):
+    print("[NAV] Moving from (0, 0) to street entrance safely...")
+    for wx, wy, hdg in plan["waypoints_to_stage"]:
+        cur_x, cur_y, _, _ = get_pose()
+        if math.hypot(wx - cur_x, wy - cur_y) < 1.0:
+            continue
+        ok, bumped = drive_to_point_cardinal(wx, wy, hdg, use_line_squaring=True, initial_blind_cm=4.0)
+        if bumped:
+            print("[WARN] Unexpected bump during approach; backing up.")
+            back_up(BUMP_BACKUP_CM, hdg)
+
+    ftx, fty = plan["first_tile_center"]
+    ok, bumped = drive_to_point_cardinal(
+        ftx, fty, plan["entry_heading"], use_line_squaring=True, initial_blind_cm=4.0
+    )
+    if bumped:
+        print("[WARN] Bumper triggered entering gate; backing up slightly.")
+        back_up(BUMP_BACKUP_CM, plan["entry_heading"])
+    print(f"[NAV] Centered inside street entry tile {plan['first_tile']}.")
+
+
+def navigate_entrance_to_origin(plan):
+    print("[NAV] Returning from street exit to (0, 0)...")
+    sx, sy = plan["stage_pt"]
+    exit_h = plan["exit_heading"]
+
+    drive_to_point_cardinal(sx, sy, exit_h, use_line_squaring=True, initial_blind_cm=BLIND_AFTER_LINE_CM)
+
+    rev_points = [(0.0, 0.0)]
+    if len(plan["waypoints_to_stage"]) > 1:
+        rev_points = [(wx, wy) for (wx, wy, _) in reversed(plan["waypoints_to_stage"][:-1])] + [(0.0, 0.0)]
+
+    for px, py in rev_points:
+        cur_x, cur_y, _, _ = get_pose()
+        dx, dy = px - cur_x, py - cur_y
+        if math.hypot(dx, dy) < 1.0:
+            continue
+        hdg = (90.0 if dx > 0 else 270.0) if abs(dx) >= abs(dy) else (0.0 if dy > 0 else 180.0)
+        drive_to_point_cardinal(px, py, hdg, use_line_squaring=True, initial_blind_cm=4.0)
+
+    turn_to_heading(START_HEADING_DEG)
+    print("[NAV] Returned cleanly to origin (0, 0).")
+
+
+# ==============================================================================
+# 10. FULL-SQUARE WALL-BOX MAPPING & PHASE 1 ENGINE
+# ==============================================================================
+def enter_street_tile(tx, ty):
+    """Mark tile as traversed street; removes any prior wall assumption on it."""
+    if not tile_in_bounds(tx, ty):
+        return
+    if (tx, ty) in wall_boxes:
+        del wall_boxes[(tx, ty)]
+    if not street_tiles or street_tiles[-1] != (tx, ty):
+        street_tiles.append((tx, ty))
+
+
+def mark_wall_box(tx, ty, source):
+    """Record a full 1x1 grid square wall box with its 4 corner coordinates."""
+    if not tile_in_bounds(tx, ty):
+        return None
+    if (tx, ty) in street_tiles or (tx, ty) in protected_open_tiles:
+        return None
+    corners = tile_corners(tx, ty)
+    wall_boxes[(tx, ty)] = {"corners": corners, "source": source}
+    return corners
+
+
+def get_adjacent_tiles_for_heading(tx, ty, heading_deg):
+    ux, uy = heading_unit_vec(heading_deg)
+    rx, ry = right_unit_vec(heading_deg)
+    side_mult = 1.0 if SIDE_SENSOR_ORIENTATION == "right" else -1.0
+
+    fx, fy = int(round(ux)), int(round(uy))
+    sx, sy = int(round(rx * side_mult)), int(round(ry * side_mult))
+
+    front_tile = (tx + fx, ty + fy)
+    side_tile = (tx + sx, ty + sy)
+    opp_tile = (tx - sx, ty - sy)
+    return front_tile, side_tile, opp_tile
+
+
+def clear_square_and_mark_walls(cleared_tile, heading_deg, saw_wall_in_tile):
+    """
+    Once the robot completely clears a street square (tx, ty), if the ultrasonic
+    sensor detected the corridor wall, mark the full 1x1 wall squares on BOTH
+    the left and right of that street tile (ignoring already-visited street tiles).
+    """
+    tx, ty = cleared_tile
+    _, side_tile, opp_tile = get_adjacent_tiles_for_heading(tx, ty, heading_deg)
+    if saw_wall_in_tile:
+        c_side = mark_wall_box(side_tile[0], side_tile[1], "cleared_side")
+        c_opp = mark_wall_box(opp_tile[0], opp_tile[1], "cleared_opp")
+        print(f"[BOX] Cleared tile {cleared_tile} -> side wall={c_side}, opp wall={c_opp}")
+
+
+def near_board_edge(cur_x, cur_y, heading_deg):
+    """
+    True if robot is in the middle of an outer boundary square heading toward
+    the outer edge of the 9x5 board (prevents ever falling off the table).
+    """
+    ux, uy = heading_unit_vec(heading_deg)
+    if ux > 0.5 and cur_x >= (MAP_X_MAX * TILE) - EDGE_STOP_MARGIN_CM:
+        return True
+    if ux < -0.5 and cur_x <= (MAP_X_MIN * TILE) + EDGE_STOP_MARGIN_CM:
+        return True
+    if uy > 0.5 and cur_y >= (MAP_Y_MAX * TILE) - EDGE_STOP_MARGIN_CM:
+        return True
+    if uy < -0.5 and cur_y <= (MAP_Y_MIN * TILE) + EDGE_STOP_MARGIN_CM:
+        return True
+    return False
+
+
+def crossed_exit_gate(plan, cur_x, cur_y, cur_heading):
+    if abs(wrap180(cur_heading - plan["exit_heading"])) > 20.0:
+        return False
+
+    ex_ux, ex_uy = heading_unit_vec(plan["exit_heading"])
+    gate_line = plan["gate_line_cm"]
+    gate_perp = plan["gate_center_perp_cm"]
+
+    if plan["gate_axis"] == "vertical":
+        perp_ok = abs(cur_y - gate_perp) <= (TILE * 0.55)
+        dist_outside = (cur_x - gate_line) * ex_ux
+    else:
+        perp_ok = abs(cur_x - gate_perp) <= (TILE * 0.55)
+        dist_outside = (cur_y - gate_line) * ex_uy
+
+    return perp_ok and dist_outside >= 2.0
+
+
+def map_street(plan, pass_num=1, reset_map=True):
+    if reset_map:
+        wall_boxes.clear()
+        street_tiles.clear()
+
+    target_heading = plan["entry_heading"]
+    side_mult = 1.0 if SIDE_SENSOR_ORIENTATION == "right" else -1.0
+
+    _, _, _, start_trav = get_pose()
+    last_line_trav = start_trav
+    last_bump_turn_trav = start_trav
+    blind_cm = BLIND_AFTER_TURN_CM
+
+    heading_sum = 0.0
+    heading_cnt = 0
+
+    bumped_once = False
+    just_turned_from_wall = False
+    last_turn_dir = 0.0
+    left_entry_tile = False
+
+    cur_tile = plan["first_tile"]
+    enter_street_tile(*cur_tile)
+    saw_wall_in_cur_tile = False
+    turned_in_cur_tile = False
+
+    last_prog_t = time.monotonic()
+    last_trav = start_trav
+    boost = 0.0
+    last_dbg = last_prog_t
+
+    sample_fresh_side_us()
+    print(f"[MAP Pass {pass_num}] Starting mapping... | {format_sensor_line()}")
+
+    while not shutdown.is_set():
+        cur_x, cur_y, cur_theta, cur_trav = get_pose()
+        tx, ty = coord_to_tile(cur_x, cur_y)
+
+        # ------------------------------------------------------------------
+        # 1. Board Edge Safety & Exit Gate Checks
+        # ------------------------------------------------------------------
+        if near_board_edge(cur_x, cur_y, target_heading):
+            stop_motors()
+            print(f"[MAP Pass {pass_num}] Reached board edge at ({cur_x:.1f}, {cur_y:.1f}). Exited maze!")
+            break
+
+        if (bumped_once or left_entry_tile) and crossed_exit_gate(plan, cur_x, cur_y, target_heading):
+            stop_motors()
+            print(f"[MAP Pass {pass_num}] Crossed exit gate (s1, s2). Mapping complete!")
+            break
+
+        # Detect transition to a new grid square (clearing the previous square)
+        if (tx, ty) != cur_tile and tile_in_bounds(tx, ty):
+            if not turned_in_cur_tile:
+                clear_square_and_mark_walls(cur_tile, target_heading, saw_wall_in_cur_tile)
+            cur_tile = (tx, ty)
+            if cur_tile != plan["first_tile"]:
+                left_entry_tile = True
+            enter_street_tile(*cur_tile)
+            saw_wall_in_cur_tile = False
+            turned_in_cur_tile = False
+
+        # ------------------------------------------------------------------
+        # 2. Front Touch Bumper Collision & 180-Deg Exit Verification
+        # ------------------------------------------------------------------
+        if is_bumper_pressed():
+            stop_motors()
+            bumped_once = True
+            dist_since_turn = cur_trav - last_bump_turn_trav
+            front_tile, side_tile, opp_tile = get_adjacent_tiles_for_heading(tx, ty, target_heading)
+
+            if just_turned_from_wall and dist_since_turn < DEAD_END_BUMP_DIST_CM:
+                # Hit wall immediately after turning into opposite side -> DEAD END
+                mark_wall_box(front_tile[0], front_tile[1], "dead_end_front")
+                print(
+                    f"[MAP Pass {pass_num}] Dead-end confirmed at {cur_tile}, wall={front_tile}. "
+                    f"Completing 180 turnaround."
+                )
+                back_up(BUMP_BACKUP_CM, target_heading)
+                target_heading = snap_cardinal(target_heading + last_turn_dir)
+                turn_to_heading(target_heading)
+
+                just_turned_from_wall = False
+                last_turn_dir = 0.0
+                turned_in_cur_tile = True
+            else:
+                side_dist = sample_fresh_side_us()
+                wall_present = (side_dist is not None and side_dist <= WALL_DETECT_THRESHOLD_CM)
+                print(
+                    f"[MAP Pass {pass_num}] Front bump at {cur_tile} | {format_sensor_line()} "
+                    f"-> side_wall={wall_present}"
+                )
+
+                back_up(BUMP_BACKUP_CM, target_heading)
+
+                if wall_present:
+                    # Sensor side is walled -> mark front & side wall boxes, turn away
+                    mark_wall_box(front_tile[0], front_tile[1], "front_bump")
+                    mark_wall_box(side_tile[0], side_tile[1], "bump_side")
+
+                    turn_deg = -90.0 if SIDE_SENSOR_ORIENTATION == "right" else +90.0
+                    target_heading = snap_cardinal(target_heading + turn_deg)
+                    turn_to_heading(target_heading)
+
+                    just_turned_from_wall = True
+                    last_turn_dir = turn_deg
+                    turned_in_cur_tile = True
+                else:
+                    # Distance sensor says there is an open path!
+                    # NEW RULE: Do 180, stop 0.5 s, check US for 0.5 s.
+                    # If ALSO open -> exited the street! If walled -> mark wall box & enter open side.
+                    print(f"[MAP Pass {pass_num}] Side open -> doing 180 check...")
+                    turn_by_angle(180.0)
+                    opposite_heading = snap_cardinal(target_heading + 180.0)
+                    stop_motors()
+                    time.sleep(0.5)
+                    opp_dist = sample_side_us_duration(0.5)
+                    opp_wall_present = (opp_dist is not None and opp_dist <= WALL_DETECT_THRESHOLD_CM)
+
+                    print(
+                        f"[MAP-180] After 180 check: US={opp_dist} cm -> opp_wall={opp_wall_present}"
+                    )
+
+                    if not opp_wall_present:
+                        print(f"[MAP Pass {pass_num}] Both sides open after 180! We got out of the path.")
+                        target_heading = opposite_heading
+                        break
+
+                    # Still inside 1-tile street: front & opposite side are wall boxes; turn into open path
+                    mark_wall_box(front_tile[0], front_tile[1], "front_bump")
+                    mark_wall_box(opp_tile[0], opp_tile[1], "180_opp_wall")
+
+                    # From 180 heading, open corridor is -90 (right sensor) or +90 (left sensor)
+                    corr_turn = -90.0 if SIDE_SENSOR_ORIENTATION == "right" else +90.0
+                    target_heading = snap_cardinal(opposite_heading + corr_turn)
+                    turn_to_heading(target_heading)
+
+                    just_turned_from_wall = False
+                    last_turn_dir = corr_turn
+                    turned_in_cur_tile = True
+
+            _, _, _, new_trav = get_pose()
+            last_bump_turn_trav = new_trav
+            last_line_trav = new_trav
+            blind_cm = BLIND_AFTER_TURN_CM
+            heading_sum = 0.0
+            heading_cnt = 0
+            last_trav = new_trav
+            last_prog_t = time.monotonic()
+            boost = 0.0
+            continue
+
+        # ------------------------------------------------------------------
+        # 3. Anti-stall watchdog
+        # ------------------------------------------------------------------
+        now = time.monotonic()
+        if abs(cur_trav - last_trav) > 0.25:
+            last_trav = cur_trav
+            last_prog_t = now
+            boost = 0.0
+        elif now - last_prog_t >= STALL_CHECK_SEC:
+            boost = min(boost + STALL_BOOST_STEP, MAX_BOOST_POWER - DRIVE_POWER)
+            last_prog_t = now
+
+        # ------------------------------------------------------------------
+        # 4. Perpendicular Light-Sensor Line Squaring
+        # ------------------------------------------------------------------
+        heading_sum += wrap180(cur_theta - target_heading)
+        heading_cnt += 1
+
+        dist_since_line = cur_trav - last_line_trav
+        if dist_since_line >= blind_cm:
+            ux, uy = heading_unit_vec(target_heading)
+            sensor_pos = (cur_x + ux * SENSOR_OFFSET) if abs(ux) > abs(uy) else (cur_y + uy * SENSOR_OFFSET)
+            nearest_line = round(sensor_pos / TILE) * TILE
+
+            if abs(sensor_pos - nearest_line) <= PERP_LINE_TOLERANCE_CM:
+                med_l, med_r = get_light_medians()
+                if is_left_on_line(med_l) or is_right_on_line(med_r):
+                    avg_h = target_heading + (heading_sum / max(1, heading_cnt))
+                    ok, line_coord = square_on_line(target_heading, dist_since_line, avg_h)
+                    _, _, _, post_trav = get_pose()
+                    last_line_trav = post_trav
+                    blind_cm = BLIND_AFTER_LINE_CM if ok else 7.0
+                    heading_sum = 0.0
+                    heading_cnt = 0
+                    last_trav = post_trav
+                    last_prog_t = time.monotonic()
+                    boost = 0.0
+
+                    if ok:
+                        just_turned_from_wall = False
+                        if (bumped_once or left_entry_tile) and abs(wrap180(target_heading - plan["exit_heading"])) <= 20.0:
+                            post_x, post_y, _, _ = get_pose()
+                            perp_pos = post_y if plan["gate_axis"] == "vertical" else post_x
+                            if (
+                                abs(line_coord - plan["gate_line_cm"]) < 2.0
+                                and abs(perp_pos - plan["gate_center_perp_cm"]) <= TILE * 0.55
+                            ):
+                                print(f"[MAP Pass {pass_num}] Squared on exit gate line (s1, s2). Mapping complete!")
+                                break
+                    continue
+
+        # ------------------------------------------------------------------
+        # 5. Smooth Quadratic Ultrasonic Wall Control + Wall Observation
+        # ------------------------------------------------------------------
+        side_dist = get_filtered_us_cm()
+        wall_angle_offset = 0.0
+
+        if side_dist is not None and side_dist <= US_TOO_FAR:
+            wall_angle_offset = compute_wall_angle_offset(side_dist, side_mult)
+            if side_dist <= WALL_DETECT_THRESHOLD_CM:
+                saw_wall_in_cur_tile = True
+        else:
+            rx, ry = right_unit_vec(target_heading)
+            tile_cx = (tx + 0.5) * TILE
+            tile_cy = (ty + 0.5) * TILE
+            lat_err_cm = (tile_cx - cur_x) * rx + (tile_cy - cur_y) * ry
+            wall_angle_offset = clamp(CROSS_TRACK_KP * lat_err_cm, -MAX_CROSS_TRACK_DEG, MAX_CROSS_TRACK_DEG)
+
+        desired_heading = target_heading + wall_angle_offset
+        heading_err = wrap180(desired_heading - cur_theta)
+        steer = clamp(HEADING_KP * heading_err, -MAX_STEER_DELTA, MAX_STEER_DELTA)
+
+        base_p = DRIVE_POWER + boost
+        left_pwr = base_p + steer
+        right_pwr = base_p - steer
+        set_drive_powers(left_pwr, right_pwr)
+
+        if now - last_dbg >= SENSOR_PRINT_INTERVAL:
+            print(
+                f"{format_sensor_line()} | tile={cur_tile} "
+                f"hdg={cur_theta:.1f}->{desired_heading:.1f} pwr=({left_pwr:.0f},{right_pwr:.0f})"
+            )
+            last_dbg = now
+
+        time.sleep(LOOP_SECONDS)
+
+    stop_motors()
+
+
+# ==============================================================================
+# 11. DIJKSTRA GRID NAVIGATION & POST-MAPPING MODES (MODE 1 / MODE 2)
+# ==============================================================================
+def build_unique_street_tiles():
+    unique = []
+    seen = set()
+    for t in street_tiles:
+        if t not in seen and tile_in_bounds(*t):
+            seen.add(t)
+            unique.append(t)
+    return unique
+
+
+def find_safe_tile_path(start_tile, goal_tile, blocked_tiles, prefer_outside_street=True):
+    """Dijkstra shortest path on 9x5 tile grid avoiding all wall boxes & minimizing turns."""
+    start = clamp_tile_in_bounds(*start_tile)
+    goal = clamp_tile_in_bounds(*goal_tile)
+    blocked = set(blocked_tiles) - {start, goal}
+    street_set = set(street_tiles)
+
+    # State: (cost, tile, prev_dir, path)
+    pq = [(0, start, None, [start])]
+    best = {}
+
+    while pq:
+        cost, cur, pdir, path = heapq.heappop(pq)
+        if cur == goal:
+            return path
+        state = (cur, pdir)
+        if state in best and best[state] <= cost:
+            continue
+        best[state] = cost
+
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nxt = (cur[0] + dx, cur[1] + dy)
+            if not tile_in_bounds(*nxt) or nxt in blocked:
+                continue
+            step_cost = 10
+            if pdir is not None and pdir != (dx, dy):
+                step_cost += 4  # Prefer fewer 90-deg turns
+            if prefer_outside_street and nxt in street_set:
+                step_cost += 20  # Prefer open floor over driving back through the street
+            heapq.heappush(pq, (cost + step_cost, nxt, (dx, dy), path + [nxt]))
+
+    return []
+
+
+def navigate_tile_path(tile_path):
+    """Drive cleanly through tile centers using line squaring and cross-track control."""
+    if not tile_path:
+        return False
+
+    # First center safely in start tile
+    sx, sy = (tile_path[0][0] + 0.5) * TILE, (tile_path[0][1] + 0.5) * TILE
+    cur_x, cur_y, _, _ = get_pose()
+    dx0, dy0 = sx - cur_x, sy - cur_y
+    if abs(dx0) > 2.5:
+        drive_to_point_cardinal(sx, cur_y, 90.0 if dx0 > 0 else 270.0, use_line_squaring=False)
+    cur_x, cur_y, _, _ = get_pose()
+    dy0 = sy - cur_y
+    if abs(dy0) > 2.5:
+        drive_to_point_cardinal(sx, sy, 0.0 if dy0 > 0 else 180.0, use_line_squaring=False)
+
+    # Now drive straight across merged collinear tile segments
+    i = 0
+    while i < len(tile_path) - 1 and not shutdown.is_set():
+        dx = tile_path[i + 1][0] - tile_path[i][0]
+        dy = tile_path[i + 1][1] - tile_path[i][1]
+        j = i + 1
+        while j < len(tile_path) - 1:
+            if (tile_path[j + 1][0] - tile_path[j][0], tile_path[j + 1][1] - tile_path[j][1]) == (dx, dy):
+                j += 1
+            else:
+                break
+
+        tx, ty = tile_path[j]
+        target_x = (tx + 0.5) * TILE
+        target_y = (ty + 0.5) * TILE
+        hdg = vec_to_heading(dx, dy)
+        drive_to_point_cardinal(target_x, target_y, hdg, use_line_squaring=True, initial_blind_cm=BLIND_AFTER_TURN_CM)
+        i = j
+
+    return True
+
+
+def run_post_mode_1_dropoff(d1, d2, plan):
+    """
+    Mode 1 (Test Run): Navigate safely around mapped wall boxes to (d1, d2),
+    turn so the robot's BACK faces the drop-off bucket, back up slightly, and stop.
+    """
+    print("\n[MODE 1] Navigating to snow drop-off location and parking back at bucket...")
+    drop_tile, park_heading = compute_dropoff_plan(d1, d2)
+
+    cur_x, cur_y, _, _ = get_pose()
+    cur_tile = clamp_tile_in_bounds(*coord_to_tile(cur_x, cur_y))
+
+    path = find_safe_tile_path(cur_tile, drop_tile, wall_boxes.keys(), prefer_outside_street=True)
+    if not path:
+        print("[WARN] Blocked in Mode 1; retrying without street penalty.")
+        path = find_safe_tile_path(cur_tile, drop_tile, wall_boxes.keys(), prefer_outside_street=False)
+
+    print(f"[MODE 1] Safe path {cur_tile} -> {drop_tile}: {path}")
+    navigate_tile_path(path)
+
+    turn_to_heading(park_heading)
+    back_up(DROP_OFF_PARK_BACKUP_CM, park_heading)
+    stop_motors()
+    print(f"[MODE 1] Parked back at drop-off {d1}-{d2} (heading={park_heading} deg). Stopped.")
+
+
+def run_post_mode_2_double_pass(plan):
+    """
+    Mode 2 (Double Pass): Navigate safely back to (s1, s2), re-enter the street
+    for a second verification pass, exit, and return cleanly to (0, 0).
+    """
+    print("\n[MODE 2] Starting Double-Pass Verification...")
+    pass1_tiles = set(build_unique_street_tiles())
+    pass1_walls = {k: dict(v) for k, v in wall_boxes.items()}
+
+    cur_x, cur_y, _, _ = get_pose()
+    cur_tile = clamp_tile_in_bounds(*coord_to_tile(cur_x, cur_y))
+
+    stage_tile = plan["stage_tile"]
+    path_to_gate = find_safe_tile_path(cur_tile, stage_tile, wall_boxes.keys(), prefer_outside_street=True)
+    if path_to_gate:
+        print(f"[MODE 2] Returning to street entrance staging tile {stage_tile}: {path_to_gate}")
+        navigate_tile_path(path_to_gate)
+
+    # Align exactly with gate staging point & re-enter street
+    sx, sy = plan["stage_pt"]
+    cur_x, cur_y, _, _ = get_pose()
+    if math.hypot(sx - cur_x, sy - cur_y) > 2.0:
+        dx, dy = sx - cur_x, sy - cur_y
+        hdg = (90.0 if dx > 0 else 270.0) if abs(dx) >= abs(dy) else (0.0 if dy > 0 else 180.0)
+        drive_to_point_cardinal(sx, sy, hdg, use_line_squaring=True, initial_blind_cm=BLIND_AFTER_TURN_CM)
+
+    ftx, fty = plan["first_tile_center"]
+    drive_to_point_cardinal(ftx, fty, plan["entry_heading"], use_line_squaring=True, initial_blind_cm=4.0)
+
+    # Run Pass 2 (keeps and verifies/updates wall_boxes & street_tiles)
+    map_street(plan, pass_num=2, reset_map=True)
+    pass2_tiles = set(build_unique_street_tiles())
+    pass2_walls = set(wall_boxes.keys())
+
+    # Reconcile Pass 1 and Pass 2
+    final_tiles = pass1_tiles | pass2_tiles
+    for wt in final_tiles:
+        if wt in wall_boxes:
+            del wall_boxes[wt]
+    for k, v in pass1_walls.items():
+        if k not in final_tiles and k not in wall_boxes:
+            wall_boxes[k] = v
+
+    print(
+        f"[VERIFY] Pass 1 tiles={len(pass1_tiles)}, Pass 2 tiles={len(pass2_tiles)} | "
+        f"Pass 1 walls={len(pass1_walls)}, Pass 2 walls={len(pass2_walls)}"
+    )
+    if pass1_tiles == pass2_tiles and set(pass1_walls.keys()) == pass2_walls:
+        print("[VERIFY] Double pass 100% consistent!")
+    else:
+        print("[VERIFY] Merged & reconciled Pass 1 + Pass 2 maps.")
+
+    navigate_entrance_to_origin(plan)
+
+
+def save_and_print_map(plan, d1, d2, post_mode):
+    unique_tiles = build_unique_street_tiles()
+    serialized_boxes = [
+        {"tile": list(k), "corners": [list(c) for c in v["corners"]], "source": v["source"]}
+        for k, v in sorted(wall_boxes.items())
+    ]
+
+    data = {
+        "s1": list(plan["s1"]),
+        "s2": list(plan["s2"]),
+        "d1": list(d1),
+        "d2": list(d2),
+        "post_mapping_mode": post_mode,
+        "street_tiles": [list(t) for t in unique_tiles],
+        "wall_boxes": serialized_boxes,
+    }
+    with open(MAP_SAVE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    print("\n" + "=" * 62)
+    print("PHASE 1 MAPPED STREET & WALL BOXES SUMMARY")
+    print(f"Street tiles ({len(unique_tiles)}): {unique_tiles}")
+    print(f"Wall boxes ({len(serialized_boxes)}) saved to {MAP_SAVE_FILE}:")
+    for wb in serialized_boxes:
+        print(f"  Wall {tuple(wb['tile'])}: corners={wb['corners']} ({wb['source']})")
+
+    tile_set = set(unique_tiles)
+    for ty in range(MAP_Y_MAX - 1, MAP_Y_MIN - 1, -1):
+        row = f"y={ty:2d} | "
+        for tx in range(MAP_X_MIN, MAP_X_MAX):
+            if (tx, ty) == plan["first_tile"]:
+                row += " E "
+            elif (tx, ty) in tile_set:
+                row += " . "
+            elif (tx, ty) in wall_boxes:
+                row += " # "
+            else:
+                row += " o "  # Open / unblocked
+        print(row)
+    print("     +" + "---" * (MAP_X_MAX - MAP_X_MIN))
+    print("       " + "".join(f"{tx:2d} " for tx in range(MAP_X_MIN, MAP_X_MAX)))
+    print("Legend: E=Entry, .=Street, #=Mapped Wall Box, o=Open")
+    print("=" * 62 + "\n")
+    return data
+
+
+# ==============================================================================
+# 12. DIAGNOSTIC & CALIBRATION MODES
+# ==============================================================================
+def run_test_sensors():
+    print("\n=== MODE: test_sensors (Press Ctrl+C to stop) ===")
+    while not shutdown.is_set():
+        print(f"{format_sensor_line()} ; Bumper: {1 if is_bumper_pressed() else 0}")
+        time.sleep(0.4)
+
+
+def run_calibrate_turn():
+    print("\n=== MODE: calibrate_turn ===")
+    target_deg = float(input("Enter target turn angle in deg (e.g. 720 or 1080): "))
+    pwr = float(input(f"Enter turn power (default {CALIB_TURN_POWER}): ") or CALIB_TURN_POWER)
+
+    _, _, start_theta, _ = get_pose()
+    turn_by_angle(target_deg, base_power=pwr)
+    actual_deg = float(input("Enter ACTUAL angle rotated physically (deg): "))
+    if abs(actual_deg) > 1e-3:
+        print(f"Suggested TURN_FACTOR multiplier: {target_deg / actual_deg:.5f}")
+    print(f"Odometry final theta: {get_pose()[2]:.2f} deg (started at {start_theta:.2f})")
+
+
+def run_calibrate_straight():
+    print("\n=== MODE: calibrate_straight ===")
+    tiles = float(input(f"Tiles to drive (default {CALIB_STRAIGHT_TILES}): ") or CALIB_STRAIGHT_TILES)
+    dist_target = tiles * TILE
+
+    with odo_lock:
+        l0 = left_distance_cm
+        r0 = right_distance_cm
+        t0 = travel_cm
+
+    while not shutdown.is_set():
+        with odo_lock:
+            traveled = travel_cm - t0
+        if traveled >= dist_target or is_bumper_pressed():
+            break
+        set_drive_powers(DRIVE_POWER, DRIVE_POWER)
+        time.sleep(LOOP_SECONDS)
+
+    stop_motors()
+    with odo_lock:
+        dl = left_distance_cm - l0
+        dr = right_distance_cm - r0
+
+    print(f"Left travel: {dl:.3f} cm | Right travel: {dr:.3f} cm")
+    if abs(dr) > 1e-3:
+        print(f"Suggested RIGHT_WHEEL_SCALE = {dl / dr:.6f}")
+
+
+def run_calibrate_light_squaring():
+    print("\n=== MODE: calibrate_light_squaring ===")
+    _, _, start_theta, start_trav = get_pose()
+    cardinal = snap_cardinal(start_theta)
+    ux, uy = heading_unit_vec(cardinal)
+    heading_sum = 0.0
+    heading_cnt = 0
+    last_dbg = time.monotonic()
+
+    while not shutdown.is_set():
+        if is_bumper_pressed():
+            print("Bumper hit before finding line.")
+            break
+        _, _, cur_theta, cur_trav = get_pose()
+        heading_sum += wrap180(cur_theta - cardinal)
+        heading_cnt += 1
+
+        if time.monotonic() - last_dbg >= 0.35:
+            print(format_sensor_line())
+            last_dbg = time.monotonic()
+
+        med_l, med_r = get_light_medians()
+        if is_left_on_line(med_l) or is_right_on_line(med_r):
+            leg_len = cur_trav - start_trav
+            avg_h = cardinal + (heading_sum / max(1, heading_cnt))
+            ok, line_coord = square_on_line(cardinal, leg_len, avg_h, verbose=True)
+            if ok:
+                cur_x, cur_y, _, _ = get_pose()
+                target_x = 0.0 if abs(uy) > abs(ux) else (line_coord + ux * 20.0)
+                target_y = (line_coord + uy * 20.0) if abs(uy) > abs(ux) else 0.0
+                print("[CALIB] Driving 20 cm to demonstrate lateral drift recovery...")
+                drive_to_point_cardinal(target_x, target_y, cardinal, use_line_squaring=False)
+            break
+
+        err = wrap180(cardinal - cur_theta)
+        corr = clamp(HEADING_KP * err, -MAX_STEER_DELTA, MAX_STEER_DELTA)
+        set_drive_powers(DRIVE_POWER + corr, DRIVE_POWER - corr)
+        time.sleep(LOOP_SECONDS)
+
+    stop_motors()
+
+
+# ==============================================================================
+# 13. MAIN ENTRY POINT
+# ==============================================================================
+def init_hardware():
+    global left_motor, right_motor, left_light, right_light, touch_sensor, side_us
+
+    print("[INIT] Creating BrickPi3 motor and sensor objects...")
+    left_motor = Motor(LEFT_MOTOR_PORT)
+    right_motor = Motor(RIGHT_MOTOR_PORT)
+    left_light = EV3ColorSensor(LEFT_LIGHT_PORT)
+    touch_sensor = TouchSensor(TOUCH_PORT)
+    side_us = EV3UltrasonicSensor(US_PORT)
+    right_light = EV3ColorSensor(RIGHT_LIGHT_PORT)
+
+    zero_encoder(left_motor)
+    zero_encoder(right_motor)
+
+    print("[INIT] Waiting for BrickPi3 sensors to become ready...")
+    wait_ready_sensors()
+    print("[INIT] All sensors ready!")
+
+
+def main():
+    init_hardware()
+    set_pose(0.0, 0.0, START_HEADING_DEG)
+
+    odo_thread = Thread(target=odometer_thread_loop, daemon=True)
+    odo_thread.start()
+    wait_for_initial_sensors()
+
+    print(f"[START] RUN_MODE='{RUN_MODE}' | Start pose=(0.0, 0.0, {START_HEADING_DEG:.1f} deg)")
+    print(f"[INIT-SENSORS] {format_sensor_line()}")
+
+    if RUN_MODE == "test_sensors":
+        run_test_sensors()
+    elif RUN_MODE == "calibrate_turn":
+        run_calibrate_turn()
+    elif RUN_MODE == "calibrate_straight":
+        run_calibrate_straight()
+    elif RUN_MODE == "calibrate_light_squaring":
+        run_calibrate_light_squaring()
+    elif RUN_MODE == "map":
+        print("\nEnter facilitator coordinates (grid units x in [-1,8], y in [-1,4]):")
+        print("  (Note: facing into the street, s1 is on the LEFT and s2 is on the RIGHT)")
+        s1 = parse_coord_pair("  s1 (x y): ")
+        s2 = parse_coord_pair("  s2 (x y): ")
+        d1 = parse_coord_pair("  d1 (x y): ")
+        d2 = parse_coord_pair("  d2 (x y): ")
+
+        mode_raw = input(
+            f"  Post-mapping mode (1=Go to Drop-Off & Park Back, 2=Double-Pass Verify, default {DEFAULT_POST_MAPPING_MODE}): "
+        ).strip()
+        post_mode = int(mode_raw) if mode_raw in ("1", "2") else DEFAULT_POST_MAPPING_MODE
+
+        plan = compute_gate_plan(s1, s2)
+        print(
+            f"[PLAN] Gate={plan['gate_axis']} | Stage={tuple(round(v/TILE, 2) for v in plan['stage_pt'])} "
+            f"| Entry heading={plan['entry_heading']} deg | Post-mode={post_mode}"
+        )
+
+        # Phase 1 Pass 1
+        navigate_origin_to_entrance(plan)
+        map_street(plan, pass_num=1, reset_map=True)
+
+        if post_mode == 1:
+            save_and_print_map(plan, d1, d2, post_mode)
+            run_post_mode_1_dropoff(d1, d2, plan)
+        else:
+            run_post_mode_2_double_pass(plan)
+            save_and_print_map(plan, d1, d2, post_mode)
+            input("Phase 1 complete. Press ENTER once facilitator authorizes Phase 2...")
+            print("[PHASE 2] Ready to enter street using saved map:", MAP_SAVE_FILE)
+    else:
+        raise ValueError(f"Unknown RUN_MODE: {RUN_MODE}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[EXIT] KeyboardInterrupt received — stopping motors safely.")
+    finally:
+        shutdown.set()
+        stop_motors()
+        time.sleep(0.05)
+        try:
+            reset_brick()
+        except Exception:
+            pass
