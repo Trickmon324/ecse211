@@ -3,8 +3,9 @@ import contextlib
 import io
 import math
 import unittest
+from unittest.mock import Mock
 import settings as S
-from robot import Robot, axes
+from robot import MotorDrive, Robot, axes
 from mapping import Mission
 
 
@@ -52,6 +53,55 @@ class Arena:
             if self.box(self.point(S.US[0],S.US[1]+dist)):
                 return dist
         return 255
+
+
+class MotorControlTests(unittest.TestCase):
+    def test_idle_does_not_report_stall(self):
+        sim = Arena([])
+        robot = Robot(sim, 120)
+        sim.sleep(S.STALL_SECONDS + 1)
+        robot.tick()
+
+    def test_one_commanded_stall_stops_both_wheels(self):
+        class OneWheelArena(Arena):
+            def power(self, left, right):
+                super().power(left, 0)
+
+        sim = OneWheelArena([])
+        robot = Robot(sim, 120)
+        robot.command(20, 20, motion="forward drive")
+        with self.assertRaisesRegex(RuntimeError, "forward drive.*right wheel"):
+            for _ in range(200):
+                robot.tick()
+        self.assertEqual(sim.p, (0, 0))
+        self.assertGreater(sim.ticks[0], 0)
+
+    def test_direct_power_clamps_and_brakes_stationary_wheel(self):
+        drive = MotorDrive.__new__(MotorDrive)
+        left, right = Mock(), Mock()
+        drive.motors = [left, right]
+        drive.signs = (1, -1)
+        drive.trims = (0, 0)
+        drive.commands = [None, None]
+        drive.power(100, 25)
+        left.set_power.assert_called_once_with(S.MAX_MOTOR_POWER)
+        right.set_power.assert_called_once_with(-25)
+        left.reset_mock()
+        drive.power(0, 25)
+        left.set_power.assert_called_once_with(0)
+        right.set_power.assert_called_once()
+        left.set_dps.assert_not_called()
+
+    def test_turn_uses_enough_power_to_start_both_wheels(self):
+        class LoadedArena(Arena):
+            def power(self, left, right):
+                super().power(left if abs(left) >= 20 else 0,
+                              right if abs(right) >= 20 else 0)
+
+        sim = LoadedArena([])
+        Robot(sim, 120).turn(90)
+        self.assertAlmostEqual(sim.h, 90, delta=S.TURN_TOLERANCE)
+        self.assertEqual(sim.p, (0, 0))
 
 
 class MappingTests(unittest.TestCase):
