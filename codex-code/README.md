@@ -1,6 +1,6 @@
 # ECSE 211 snow robot mapping
 
-Extract the ZIP on the Pi. Run from the folder containing mapping.py and the supplied course utils directory. For a GitHub checkout, copy project/utils from the repository's project.zip into codex-code/. Requires the course BrickPi Python installation. The motor and sensor calls use utils.brick.
+Extract the ZIP on the Pi. Run from the folder containing mapping.py and the supplied course utils directory. Requires the course BrickPi Python installation. The motor and sensor calls use utils.brick.
 
 ## Wiring and setup
 
